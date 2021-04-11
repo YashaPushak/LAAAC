@@ -1,0 +1,21 @@
+# Setup Arguments
+# ---------------
+experiment-dir = .
+output-dir = laaac-output
+temp-dir = .
+verbose = 1
+optimizer = GPSLS
+
+# Scenario Arguments
+# ------------------
+algo-cutoff-time = 0
+config-budget = 2147483647
+wallclock-limit = 2147483647
+cpus-per-trial = 1
+gpus-per-trial = 0
+cluster-ip-address = None
+grace-period = 1
+max-fidelity = 100
+fidelity-step = 1
+integer-fidelity = True
+objective = mean
