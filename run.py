@@ -179,6 +179,5 @@ with cd(arguments['experiment_dir']):
     logger.info('Final results:')
     logger.info(final_results)
     with pd.option_context('display.max_rows', 50, 'display.max_columns', 10):
-        logger.info('Incumbent Trajectory:')
-        logger.info(incumbent_trajectory)
+        logger.info(f'Incumbent Trajectory:\n{incumbent_trajectory}')
     incumbent_trajectory.to_csv(f'{log_location}/incumbent_trajectory_{run_id}.csv')
