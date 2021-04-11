@@ -13,7 +13,7 @@ def _get_trial_results(analysis, iter_fidelity, gpsls):
     if gpsls:
         columns = ['all_losses', 'all_timestamps', 
                    'new_current_runtime', 'real_configuration', 'new_timestamps',
-                   'current_fidelity_budget', 'line_search_end_step_timestamp']
+                   'new_current_fidelity_budget', 'line_search_end_step_timestamp']
     else:
         columns = ['current_loss', 'all_timestamps', 'current_runtime', 'configuration', 'current_fidelity_budget']
     if iter_fidelity:
@@ -49,7 +49,7 @@ def _flatten(df, columns_to_flatten, new_column_names, config_column='real_confi
                 flattened = eval(entry[columns_to_flatten[j]].replace('inf', 'float("inf")'))
             else:
                 flattened = entry[columns_to_flatten[j]]
-            if isisnstance(flattened, list):
+            if isinstance(flattened, list):
                 flattened_columns[j].extend(flattened)
             else:
                 flattened_columns[j].append(flattened)
@@ -155,7 +155,7 @@ def _get_gpsls_budget_and_incumbents(df):
     # At every step returned by GPS-ASHA, it returns a bunch of information
     # about all of the *new* configuration runs that were performed. This
     # information is not returned again in the next step of the same trial runner.
-    df_budget = _flatten(df, ['new_current_runtime', 'current_fidelity_budget', 'new_timestamps'],
+    df_budget = _flatten(df, ['new_current_runtime', 'new_current_fidelity_budget', 'new_timestamps'],
                              ['Runtime', 'Fidelity Budget', 'Timestamp'])
     # Now get only the last entry for each unique real configuration.
     # At each step of GPS-ASHA, it also returns the history of all run information
@@ -284,7 +284,7 @@ def analyze_results(trial_analysis, objective='mean', mode='min',
     df_traj = _get_final_fidelity_budgets(df_budget, df_traj, objective)
     # Also extract from this the final results
     final_results = SimpleNamespace(
-        incumbent=df_traj.tail(1)['Configuration'],
+        incumbent=df_traj.tail(1)['Configuration'].iloc[0],
         total_fidelity_spent=df_budget['Fidelity Budget'].sum(),
         total_wallclock_time=df['Timestamp End'].max(),
         total_target_time=df_budget['Runtime'].sum())
