@@ -4,6 +4,52 @@ Includes two experimental automated algorithm configiruation procedures designed
 to exploit landscape structure. In particular, these configurators were designed
 to target AutoMl hyper-parameter optimization scenarios.
 
+The first method uses a breadth-first asynchronous successive halving algorithm
+(ASHA) to terminate simple golden-parameter-search-based line searches (GPSLS).
+Each GPSLS run starts with a randomly initiliazed configuration, and then
+repeatedly performs line searches along random vectors of the numeric-valued
+portion of the parameter configuration space. 
+
+The second method uses sequentially-fit convex quadratic model approximations
+(CQA) to model the parameter configuration landscapes. It uses these models
+(which are fitted only when the amount of collected configuration data has 
+increased exponentially) to guide the search process. It has three kinds of 
+configuration suggestions:
+ 1. Moon shots, whereby it attempts to solve the problem by making its single
+best guess about the global optimizer. Only one moon shot is made per fitted
+model.
+ 2. Safe guesses, which use the model to guide the search process from around
+the current incumbent in directions that are expected to improve the solution
+quality.
+ 3. Random guesses, which are used initialy when there is insufficient data
+available to fit a model, or when something goes wrong with guess types 1 and
+2.
+The CQA search procedure suggests configurations which are then evaluated
+with breadth-first ASHA. To help speed-up the search over the categorical
+parameters, CQA uses a modified version of the rising bandits algorithm,
+wherein random configurations of the categorical parameters are sampled at
+each suggestion step (instead of looping over all possible combinations)
+and once there is enough data to start doing comparisons between sets of
+categorical parameter values, it uses a linearization procedure that uses
+the last 50% of all anytime loss data available for each arm.
+
+GPSLS typically works best when low-fidelity budget evaluations of the 
+configuration yield reasonably accurate approximations of high-fidelity
+evaluations. GPSLS also has an advantage over (CQA) for high-dimensional
+parameter configuration spaces. For GPSLS, increasing the number of categorical
+parameters (assuming new ones are unimportant) will make the problem harder to
+solve; however, increasing the number if un-important numeric-valued parameters
+has no effect on the difficulty of the problem. CQA tends to work best on 
+low-dimensional problems -- especially those with mostly numeric-valued
+parameters -- where the measure of fidelity used to evaluate configurations is
+the number of repeated runs of the target algorithm (i.e., when optimizing
+for mean loss). CQA can still be competitive in high-dimensional scenarios;
+however, due to the large number of arms to search and/or the large number
+of numeric-valued dimensions, it can be much slower for it to collect enough
+data to begin fitting and models and then outperforming random search. 
+In comparison, GPSLS is much more greedy and immediately begins exploiting the
+discovery of high-quality configurations.
+
 This repository is a work in progress and it builds upon the line of research:
 
  - Yasha Pushak and Holger H. Hoos.  
@@ -32,12 +78,13 @@ Solving from Nature (PPSN 2018)*. pp 271-283 (2018).
 # Installing LAAAC
 
  1. Create a python virtual environment
- 4. Download the latest version of LAAAC from https://github.com/YashaPushak/LAAAC
- 5. While in the main LAAAC directory, install LAAAC's other required python 
-packages
-`pip install -r requirements.txt`.
- 6. While in the main LAAAC directory, install LAAAC with 
+ 2. Download the latest version of LAAAC from https://github.com/YashaPushak/LAAAC
+ 3. While in the main LAAAC directory, install LAAAC with 
 `pip install .`
+
+If you want to be able to plot the output from the example directory, install the optional
+dependencies with:
+`pip install .[plot]`
 
 # Quick Start Guide
 
@@ -57,7 +104,7 @@ a directory for each optimizer (that has been used), log files, incumbent trajec
 and the raw ray.tune output files. If a run crashes and you need to extract the anytime incumbent
 trajectories from the raw files, see `./examples/artificial-classifier/get_results_from_logs.py`. Note
 that you can run this as a regular file, or as a streamlit application using 
-`pip install streamlit`
+`pip install .[plot]`
 and then
 ` streamlit run get_results_from_logs.py`
 
