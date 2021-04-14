@@ -108,11 +108,13 @@ class CQASearcher(Searcher):
         self._configurations = {}
         self._models = {}
         self._suggested_optimizer = defaultdict(bool)  # Initializes to False
-        self._model_weights = defaultdict(int)  # Initializes to 0
+        self._budget_spent = defaultdict(int)  # Initializes to 0
+        self._last_model_fidelity = defaultdict(lambda: grace_period)
         self._model_fit_factor = model_fit_factor
         self._lambda = lambda_
         self._norm = norm
         self._data = {}
+        self._num_vals = {}
         self._cat_rewards = defaultdict(list)
         self._cat_times = defaultdict(list)
         self._cat_eliminated = []
@@ -152,7 +154,8 @@ class CQASearcher(Searcher):
             # And get a configuration for the numerical parameters predicted to be of high quality
             num_val = _get_next_config(
                 model, self._suggested_optimizer[cat_key], 
-                self._data[cat_key], self._transformers[cat_key], self._random_fraction)
+                self._data[cat_key], self._num_vals[cat_key],
+                self._transformers[cat_key], self._random_fraction)
             # If it wasn't already suggested, then we're about to.
             self._suggested_optimizer[cat_key] = True
             config = self._to_configuration(num_hp, num_val, cat_hp, cat_val)
@@ -265,14 +268,19 @@ class CQASearcher(Searcher):
             LOGGER.debug('********** Quadratic Model Approximation **********')
             # Accumulate the numeric data for this set of categorical values 
             if cat_key not in self._data:
-                self._data[cat_key] = {}
-            self._data[cat_key][num_val] = (budget, loss)
-            # We only fit a new model if there is enough data to do so
-            n_samples = len(self._data[cat_key])
+                self._data[cat_key] = []
+                self._num_vals[cat_key] = {}
+            self._data[cat_key].append((trial_id, budget, loss))
+            self._num_vals[cat_key][trial_id] = num_val
+            # Gets the data with the best fidelity available for training,
+            # provied that we have collected enough new data since the last
+            # model fit. 
+            X_train, y_train, budgets, current_fidelity, current_budget_spent = self._get_data_for_training(
+                self._data[cat_key], self._num_vals[cat_key], len(num_val), self._last_model_fidelity[cat_key],
+                self._budget_spent[cat_key])
             min_n_samples_separable = SCQA.min_samples(len(num_val))
-            LOGGER.debug(f'Number of training examples: {n_samples}; '
-                         f'Minimum number of training examples to fit model: {min_n_samples_separable}')
-            if n_samples >= min_n_samples_separable:
+            if X_train is not None:
+                n_samples = len(X_train)
                 min_n_samples_general = GCQA.min_samples(len(num_val))
                 if n_samples >= min_n_samples_general:
                     LOGGER.debug('Fitting a general convex quadratic under-estimator model.')
@@ -282,64 +290,102 @@ class CQASearcher(Searcher):
                                  f'({min_n_samples_general}) required to fit a general convex '
                                  f'quadratic model, so we are fitting a separable one instead.')
                     model = SCQA()
-                X_train = list(self._data[cat_key].keys())
-                data = np.array([self._data[cat_key][x] for x in X_train])
-                X_train = np.array(X_train, dtype=float)
-                y_train = data[:,1]
-                budgets = data[:,0]
-                # Only fit a new model if we have observed a sufficient amount of new data
-                # to warrant the cost of the model fitting process.
-                if np.sum(budgets) >= self._model_weights[cat_key]*self._model_fit_factor:
-                    # Transform the numeric hyper-parameters to a unit cube
-                    if cat_key not in self._transformers:
-                        transformer = Transformer()
-                        transformer.fit(num_hp, self._config_space)
-                        self._transformers[cat_key] = transformer
-                    X_train = self._transformers[cat_key].transform(X_train)
-                    LOGGER.debug('Transformed X_train:')
-                    LOGGER.debug(X_train)
-                    # Scale the losses so that the constraints on the parameters
-                    # in the model don't make the optimal solution infeasable
-                    y_transformer = RobustScaler()
-                    y_train = y_transformer.fit_transform(y_train.reshape(-1, 1)).squeeze()
-                    LOGGER.debug('Transformed y_train:')
-                    LOGGER.debug(y_train)
-                    LOGGER.debug('Sample_weights (fidelity budgets):')
-                    LOGGER.debug(budgets)
-                    try:
-                        model.fit(X_train, y_train, sample_weight=budgets)
-                        LOGGER.debug('Successfully fit the model.')
-                        # Make sure the new model hasn't diverged to something worse
-                        # than the old one
-                        if cat_key in self._models:
-                            old_pred = self._y_transformers[cat_key].inverse_transform(
-                                self._models[cat_key].predict(X_train).reshape((-1, 1))).squeeze()
-                            old_score = np.mean(np.abs(old_pred - data[:,1])*budgets)/np.sum(budgets)
-                        else:
-                            old_score = None
-                        new_pred = y_transformer.inverse_transform(model.predict(X_train).reshape((-1, 1))).squeeze()
-                        new_score = np.mean(np.abs(new_pred - data[:,1])*budgets)/np.sum(budgets)
-                        LOGGER.debug(f'The MAE of the new model is {new_score}')
-                        LOGGER.debug(f'The MAE of the old model is {old_score}')
-                        if old_score is None or new_score <= old_score:
-                            self._models[cat_key] = model
-                            self._y_transformers[cat_key] = y_transformer
-                            self._suggested_optimizer[cat_key] = False
-                            LOGGER.debug('Accepted the new model.')
-                        else:
-                            LOGGER.debug('Rejected the new model; keeping the old one for now.')
-                    except Exception as e:
-                        # Something went wrong. Don't update the model.
-                        LOGGER.debug('Something went wrong with the model fitting and scoring process, '
-                                     'falling back on the previous model, if available.', exc_info=e)
-                    # Update the model weight even if something failed, so we don't get stuck wasting
-                    # Time constantly trying to re-build this model when the data has hardly changed/
-                    self._model_weights[cat_key] = np.sum(budgets)
-                else:
-                    LOGGER.debug(f'Skipping model fitting because the available training '
-                                 f'data has used a combined fidelity budget of '
-                                 f'{np.sum(budgets)}, which is less than the required amount: '
-                                 f'{self._model_fit_factor}*{self._model_weights[cat_key]}')
+                # Transform the numeric hyper-parameters to a unit cube
+                if cat_key not in self._transformers:
+                    transformer = Transformer()
+                    transformer.fit(num_hp, self._config_space)
+                    self._transformers[cat_key] = transformer
+                X_train = self._transformers[cat_key].transform(X_train)
+                LOGGER.debug('Transformed X_train:')
+                LOGGER.debug(X_train)
+                # Scale the losses so that the constraints on the parameters
+                # in the model don't make the optimal solution infeasable
+                y_transformer = RobustScaler()
+                y_train = y_transformer.fit_transform(y_train.reshape(-1, 1)).squeeze()
+                LOGGER.debug('Transformed y_train:')
+                LOGGER.debug(y_train)
+                LOGGER.debug('Sample_weights (fidelity budgets):')
+                LOGGER.debug(budgets)
+                try:
+                    model.fit(X_train, y_train, sample_weight=budgets)
+                    LOGGER.debug('Successfully fit the model.')
+                    # Make sure the new model hasn't diverged to something worse
+                    # than the old one
+                    if cat_key in self._models:
+                        old_pred = self._y_transformers[cat_key].inverse_transform(
+                            self._models[cat_key].predict(X_train).reshape((-1, 1))).squeeze()
+                        old_score = np.mean(np.abs(old_pred - data[:,1])*budgets)/np.sum(budgets)
+                    else:
+                        old_score = None
+                    new_pred = y_transformer.inverse_transform(model.predict(X_train).reshape((-1, 1))).squeeze()
+                    new_score = np.mean(np.abs(new_pred - data[:,1])*budgets)/np.sum(budgets)
+                    LOGGER.debug(f'The MAE of the new model is {new_score}')
+                    LOGGER.debug(f'The MAE of the old model is {old_score}')
+                    if old_score is None or new_score <= old_score:
+                        self._models[cat_key] = model
+                        self._y_transformers[cat_key] = y_transformer
+                        self._suggested_optimizer[cat_key] = False
+                        self._last_model_fidelity[cat_key] = current_fidelity
+                        LOGGER.debug('Accepted the new model.')
+                    else:
+                        LOGGER.debug('Rejected the new model; keeping the old one for now.')
+                except Exception as e:
+                    # Something went wrong. Don't update the model.
+                    LOGGER.debug('Something went wrong with the model fitting and scoring process, '
+                                 'falling back on the previous model, if available.', exc_info=e)
+                # Update the model weight even if something failed, so we don't get stuck wasting
+                # Time constantly trying to re-build this model when the data has hardly changed/
+                self._budget_spent[cat_key] = current_budget_spent
+
+    def _get_data_in_window(self, df, fidelity):
+        window = np.logical_and(fidelity <= df['Fidelity'], 
+                                df['Fidelity'] <= fidelity*self._reduction_factor)
+        # Grab only the result with the largest fidelity for each configuration.
+        data_in_window = df[window].groupby('ID').tail(1)
+        return data_in_window
+
+    def _data_to_df(self, data):
+        df = pd.Dataframe(data, colums=['ID', 'Fidelity', 'Loss'])
+        df = df.sort_values('Fidelity')
+        return df
+
+    def _get_data_for_training(self, data, num_vals, n_dim, fidelity, last_budget_spent):
+        # Setup
+        min_n_samples_separable = SCQA.min_samples(n_dim)
+        last_data = None
+        df = self._data_to_df(data)
+        # We only fit a new model if the sum of the fidelity budgets has increased by an
+        # exponential factor.
+        budget_spent = df.groupby('ID').tail(1)['Fidelity'].sum()
+        budget_needed = budget_spent*self._model_fit_factor
+        if budget_spent >= last_budget_needed:
+            data_in_window = self._get_data_in_window(df, fidelity)
+            LOGGER.debug(f'Checking to find the largest fidelity budget window with sufficient data '
+                         f'to fit a model. '
+                         f'Minimum number of training examples to fit model: {min_n_samples_separable}')
+            # Make the window as large as possible while there is still enough data.
+            while len(data_in_window) >= min_n_samples_separable:
+                last_data = data_in_window
+                fidelity *= self._reduction_factor
+                data_in_window = self._get_data_in_window(df, fidelity)
+                LOGGER.debug(f'Budget fidelity window {fidelity} to {fidelity*self._reduction_factor} has '
+                             f'{len(data_in_window)} data samples available.')
+        else:
+            LOGGER.debug(f'Skipping model fitting because the available training '
+                         f'data has used a combined fidelity budget of '
+                         f'{budget_spent}, which is less than the required amount: '
+                         f'{budget_needed}')
+
+        # We only fit a new model if we found a window with enough data        
+        if last_data is not None:
+            X_train = np.array(list(last_data['ID'].map(num_vals)))
+            y_train = np.array(last_data['Loss'])
+            budgets = np.array(last_data['Fidelity'])
+        else:
+            X_train = None
+            y_train = None
+            budgets = None
+        return X_train, y_train, budgets, fidelity, budget_spent
            
     def _group_hps(self, config):
         numeric = []
@@ -374,11 +420,12 @@ class CQASearcher(Searcher):
         return config
 
 
-def _get_next_config(model, suggested_optimizer, data, transformer, random_fraction, n_samples=5):
-    X_train = list(data.keys())
-    data = np.array([data[x] for x in X_train])
-    X_train = np.array(X_train, dtype=float)
-    y_train = data[:,1]
+def _get_next_config(model, suggested_optimizer, data, num_vals, transformer, random_fraction, n_samples=5, top_k=3):
+    df = self._data_to_df(data)
+    # Keep only the largest fidelity for each configuration
+    df = df.groupby('ID').tail(1)
+    X_train = np.array(list(df['ID'].map(num_vals))
+    y_train = np.array(df['Loss']) 
     x_inc = X_train[np.argmin(y_train)]
     LOGGER.debug(f'The current incumbent is: {x_inc}')
     x_inc = transformer.transform(x_inc)
@@ -423,8 +470,13 @@ def _get_next_config(model, suggested_optimizer, data, transformer, random_fract
         var = (2/len(X_train) + 0.05)**2
         LOGGER.debug(f'Using a variance of {var}')
         # Sample n_samples configurations and reject any that are infeasable.
-        LOGGER.debug(f'Sampling {n_samples} configurations.')
-        x_next = np.random.multivariate_normal(x_inc, cov=np.diag([var]*len(x_inc)), size=n_samples)
+        LOGGER.debug(f'Sampling {n_samples} configurations for each of the top {top_k} configurations.')
+        X_next = []
+        for idx in np.argpartition(y_train, top_k)[:top_k]:
+            x_top = X_trainn[idx]
+            x_next = np.random.multivariate_normal(x_top, cov=np.diag([var]*len(x_inc)), size=n_samples)
+            X_next.append(x_next)
+        x_next = np.concatenate(X_next, axis=0)
         feasable = np.logical_and(np.all(x_next >= 0, axis=1), np.all(x_next <= 1, axis=1))
         if np.any(feasable):
             # Grab the first feasable configurationlgorithm.
@@ -441,108 +493,6 @@ def _get_next_config(model, suggested_optimizer, data, transformer, random_fract
     x_next = transformer.inverse_transform(x_next)
     LOGGER.debug(f'The new set of numeric values to evaluate (in the original space) are {x_next}')
     return x_next
-
-
-old = '''
-def _get_next_config(model, suggested, data, transformer, random_fraction, n_samples=50):
-    train_size = len(data)
-    x_star = model.get_minimizer()
-    LOGGER.debug(f"The model's minimizer (when encoded) is: {x_star}")
-    # We use the transformer here because it also clips the configuration
-    # to make it feasible if need be since the model's optimizer may not be
-    # feasible.
-    x_star = np.clip(x_star, 0, 1)
-    LOGGER.debug(f'When clipped to be feasable it is: {x_star}')
-    # If a configuration very similar to this one been evaluated before,
-    # sample a new one instead. Also sample a random fraction of the
-    # configurations anyways to help ensure some diversity. The random
-    # fraction helps inject diversity when only non-important hyper-
-    # parameters are changing between configurations.
-    similar = len(suggested) > 0 and np.isclose(x_star, suggested, rtol=0.01).all(axis=1).any()
-    force_random = np.random.random() < random_fraction 
-    if similar or force_random:
-        LOGGER.debug(f'Sampling from a Guassian instead of returning the minimizer because:\n'
-                     f'  - Something similar has been evaluated before? {similar}.\n'
-                     f'  - This is one of {random_fraction*100:.2f}% forced-random samples? {force_random}.')
-        # Get the model's hessian.
-        _, _, H = model.get_model()
-        LOGGER.debug("The model's Hessian is")
-        LOGGER.debug(H)
-        # And get a covariance matrix of a multi-variate Guassian that
-        # we can sample from using the Hessian.
-        cov = _get_covariance(H, train_size)
-        LOGGER.debug("The Guassian's covariance matrix is")
-        LOGGER.debug(cov)
-        # Sample n_samples configurations and reject any that are infeasable.
-        LOGGER.debug(f'Sampling {n_samples} configurations to check for a feasable one.')
-        x_next = np.random.multivariate_normal(x_star, cov=cov, size=n_samples)
-        feasable = np.logical_and(np.all(x_next >= 0, axis=1), np.all(x_next <= 1, axis=1))
-        if np.any(feasable):
-            # Grab the first feasable configuration.
-            x_next = x_next[np.where(feasable)[0][0]]
-            LOGGER.debug('Found a feasable configuration for the numeric hyperparameters')
-        else:
-            # Sample a random configuration from the unit cube to
-            # help improve the model.
-            x_next = np.random.random(len(x_star))
-            LOGGER.debug('None of the sampled configurations were feasable. Sampling '
-                         'uniformly at random from the unit cube instead.')
-    else:
-        x_next = x_star
-    suggested.append(x_next)
-    x_next = transformer.inverse_transform(x_next)
-    LOGGER.debug(f'The new set of numeric values to evaluate (in the original space) are {x_next}')
-    return x_next
-
-
-def _get_covariance(H, n):
-    """
-    Parameters
-    ----------
-    H : np.ndarray
-      The Hessian of the fitted quadratic model.
-    n : int
-      The number of training examples used to fit the model.
-
-    Returns
-    -------
-    np.ndarray
-       The covariance matrix of a multi-variate Guassian distribution
-       that can be used to sample configurations expected to be of a
-       high quality if centered around the optimum of the model.
-    """
-    # Get the inverse Hessian so that eigenvectors with large eigenvalues
-    # have eigenvalues that are small instead. (This way we sample less far
-    # away along vectors along with the model grows quickly.)
-    H_inv = np.linalg.inv(H)
-    # Get the eigenvalues of the inverse Hessian
-    eigenvalues, _ = np.linalg.eigh(H_inv)
-    LOGGER.debug(f'The eigenvalues of the inverse Hessian are {eigenvalues}')
-    # For simplicitly, assume we have a uni-variate quadratic scaled by the
-    # maximum eigenvalue of H (which is one over the minimum eigenvalue of
-    # H_inv) that is centered at 0.5 and has a domain of [0, 1], and we want
-    # to obtain the length x from 0.5 such that all f(x) <= y*f(0.5), where y
-    # is in (0, 1) and progressively shrinks as the search process progresses.
-    # If y=0.1, then this means we want to sample from a Guassian such that all
-    # samples within the first standard deviation from the mean are within 10%
-    # of optimal in the objective space.
-    def f_inv(x):
-        # Multiplying by the minimum eigenvalue of H_inv is equivalent to
-        # dividing by the maximum eigenvalue of H.
-        return np.sqrt(x*np.min(eigenvalues))
-    # Set y to cut in half every time the number of samples doubles and square
-    # to convert standard deviation to variance.
-    percent_from_optimal = 0.5**(np.log(n*2/4)/np.log(2))
-    LOGGER.debug(f'Sampling with one standard deviation equal to approximately '
-                 f'{percent_from_optimal*100:.3f}% from the optimal objective '
-                 f'function value.')
-    min_var = f_inv(percent_from_optimal)**2
-    LOGGER.debug(f'Adjusting the inverse Hessian so that the eigenvector for '
-                 f'the minimum eigenvalue corresponds to a standard devaition '
-                 f'of {np.sqrt(min_var):.5f}')
-    # Rescale the inverse Hessian
-    return H_inv*min_var/np.min(eigenvalues)
-'''
 
 
 class Transformer():
