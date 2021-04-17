@@ -82,13 +82,14 @@ class CQASearcher(Searcher):
       Optionally enables logging to a file.
     log_level : int
       A log level, e.g., logging.DEBUG.
-    log_formatter : str | None
+    log_formatter : logging.Formatter | str | None
       A log formatter or None to use the default.
     """
     def __init__(self, config_space, metric, max_t, grace_period=1, reduction_factor=4, mode='min',
                  budget='budget', categorical_grace_period=20, failed_result=1, random_fraction=0.5,
                  wall_time=None, wall_time_budget=None, model_fit_factor=1.5, lambda_=0, norm=1, 
-                 log_location='CQA.log', log_level=logging.DEBUG, log_formatter=None, **kwargs):
+                 window_size=0, log_location='CQA.log', log_level=logging.DEBUG,
+                 log_formatter='%(asctime)s:%(name)s:%(levelname)s: %(message)s', **kwargs):
         super().__init__(metric=metric, mode=mode, **kwargs)
         self._config_space = config_space
         self._metric = metric
@@ -110,6 +111,7 @@ class CQASearcher(Searcher):
         self._suggested_optimizer = defaultdict(bool)  # Initializes to False
         self._budget_spent = defaultdict(int)  # Initializes to 0
         self._last_model_fidelity = defaultdict(lambda: grace_period)
+        self._window_size = window_size
         self._model_fit_factor = model_fit_factor
         self._lambda = lambda_
         self._norm = norm
@@ -126,6 +128,8 @@ class CQASearcher(Searcher):
             fh = logging.FileHandler(log_location)
             fh.setLevel(log_level)
             if log_formatter is not None:
+                if isinstance(log_formatter, str):
+                    log_formatter = logging.Formatter(log_formatter)
                 fh.setFormatter(log_formatter)
             LOGGER.addHandler(fh)
         LOGGER.setLevel(log_level)
@@ -152,10 +156,11 @@ class CQASearcher(Searcher):
             # Get the model for these categorical_values.
             model = self._models[cat_key]
             # And get a configuration for the numerical parameters predicted to be of high quality
-            num_val = _get_next_config(
+            num_val = self._get_next_config(
                 model, self._suggested_optimizer[cat_key], 
                 self._data[cat_key], self._num_vals[cat_key],
-                self._transformers[cat_key], self._random_fraction)
+                self._transformers[cat_key], self._random_fraction,
+                self._last_model_fidelity[cat_key])
             # If it wasn't already suggested, then we're about to.
             self._suggested_optimizer[cat_key] = True
             config = self._to_configuration(num_hp, num_val, cat_hp, cat_val)
@@ -301,6 +306,7 @@ class CQASearcher(Searcher):
                 # Scale the losses so that the constraints on the parameters
                 # in the model don't make the optimal solution infeasable
                 y_transformer = RobustScaler()
+                y_train_untransformed = y_train
                 y_train = y_transformer.fit_transform(y_train.reshape(-1, 1)).squeeze()
                 LOGGER.debug('Transformed y_train:')
                 LOGGER.debug(y_train)
@@ -314,11 +320,11 @@ class CQASearcher(Searcher):
                     if cat_key in self._models:
                         old_pred = self._y_transformers[cat_key].inverse_transform(
                             self._models[cat_key].predict(X_train).reshape((-1, 1))).squeeze()
-                        old_score = np.mean(np.abs(old_pred - data[:,1])*budgets)/np.sum(budgets)
+                        old_score = np.mean(np.abs(old_pred - y_train_untransformed)*budgets)/np.sum(budgets)
                     else:
                         old_score = None
                     new_pred = y_transformer.inverse_transform(model.predict(X_train).reshape((-1, 1))).squeeze()
-                    new_score = np.mean(np.abs(new_pred - data[:,1])*budgets)/np.sum(budgets)
+                    new_score = np.mean(np.abs(new_pred - y_train_untransformed)*budgets)/np.sum(budgets)
                     LOGGER.debug(f'The MAE of the new model is {new_score}')
                     LOGGER.debug(f'The MAE of the old model is {old_score}')
                     if old_score is None or new_score <= old_score:
@@ -337,38 +343,37 @@ class CQASearcher(Searcher):
                 # Time constantly trying to re-build this model when the data has hardly changed/
                 self._budget_spent[cat_key] = current_budget_spent
 
-    def _get_data_in_window(self, df, fidelity):
+    def _get_data_in_window(self, df, fidelity, window_size):
         window = np.logical_and(fidelity <= df['Fidelity'], 
-                                df['Fidelity'] <= fidelity*self._reduction_factor)
+                                df['Fidelity'] <= fidelity*self._reduction_factor**window_size)
         # Grab only the result with the largest fidelity for each configuration.
         data_in_window = df[window].groupby('ID').tail(1)
         return data_in_window
-
-    def _data_to_df(self, data):
-        df = pd.Dataframe(data, colums=['ID', 'Fidelity', 'Loss'])
-        df = df.sort_values('Fidelity')
-        return df
 
     def _get_data_for_training(self, data, num_vals, n_dim, fidelity, last_budget_spent):
         # Setup
         min_n_samples_separable = SCQA.min_samples(n_dim)
         last_data = None
-        df = self._data_to_df(data)
+        df = _data_to_df(data)
         # We only fit a new model if the sum of the fidelity budgets has increased by an
         # exponential factor.
         budget_spent = df.groupby('ID').tail(1)['Fidelity'].sum()
-        budget_needed = budget_spent*self._model_fit_factor
-        if budget_spent >= last_budget_needed:
-            data_in_window = self._get_data_in_window(df, fidelity)
+        budget_needed = last_budget_spent*self._model_fit_factor
+        if budget_spent >= budget_needed:
+            data_in_window = self._get_data_in_window(df, fidelity, self._window_size)
             LOGGER.debug(f'Checking to find the largest fidelity budget window with sufficient data '
                          f'to fit a model. '
                          f'Minimum number of training examples to fit model: {min_n_samples_separable}')
+            LOGGER.debug(f'Budget fidelity window {fidelity} to '
+                         f'{fidelity*self._reduction_factor**self._window_size} has '
+                         f'{len(data_in_window)} data samples available.')
             # Make the window as large as possible while there is still enough data.
             while len(data_in_window) >= min_n_samples_separable:
                 last_data = data_in_window
                 fidelity *= self._reduction_factor
-                data_in_window = self._get_data_in_window(df, fidelity)
-                LOGGER.debug(f'Budget fidelity window {fidelity} to {fidelity*self._reduction_factor} has '
+                data_in_window = self._get_data_in_window(df, fidelity, self._window_size)
+                LOGGER.debug(f'Budget fidelity window {fidelity} to '
+                             f'{fidelity*self._reduction_factor**self._window_size} has '
                              f'{len(data_in_window)} data samples available.')
         else:
             LOGGER.debug(f'Skipping model fitting because the available training '
@@ -378,9 +383,10 @@ class CQASearcher(Searcher):
 
         # We only fit a new model if we found a window with enough data        
         if last_data is not None:
-            X_train = np.array(list(last_data['ID'].map(num_vals)))
-            y_train = np.array(last_data['Loss'])
-            budgets = np.array(last_data['Fidelity'])
+            X_train = np.array(list(last_data['ID'].map(num_vals)), dtype=float)
+            y_train = np.array(last_data['Loss'], dtype=float)
+            budgets = np.array(last_data['Fidelity'], dtype=float)
+            fidelity /= self._reduction_factor
         else:
             X_train = None
             y_train = None
@@ -419,103 +425,122 @@ class CQASearcher(Searcher):
                 = int(val) if isinstance(self._config_space.get_hyperparameter(str(hp)), Integer) else float(val)
         return config
 
+    def _get_next_config(self, model, suggested_optimizer, data, num_vals, transformer, random_fraction,
+                         last_model_fidelity,  n_samples=3, top_k=3):
+        df = _data_to_df(data)
+        n_configs_evaluated = len(df.groupby('ID').tail(1))
+        df = self._get_data_in_window(df, last_model_fidelity, window_size=2)
+        # Keep only the largest fidelity for each configuration
+        X_train = np.array(list(df['ID'].map(num_vals)), dtype=float)
+        y_train = np.array(df['Loss'], dtype=float) 
+        x_inc = X_train[np.argmin(y_train)]
+        LOGGER.debug(f'The current incumbent is: {x_inc}')
+        x_inc = transformer.transform(x_inc)
+        LOGGER.debug(f'Or, when transformed: {x_inc}')
+        x_next = None
+        # If we haven't yet suggested it, suggest the optimizer of the model
+        if not suggested_optimizer: 
+            x_star = model.get_minimizer()
+            LOGGER.debug(f"The model's minimizer (when encoded) is: {x_star}")
+            # Check if the optimizer if feasable
+            if not (np.all(x_star >= 0) and np.all(x_star <= 1)):
+                LOGGER.debug(f'Since the minimizer is not feasable we are going to progressively '
+                             f'do line searches along the eigenvectors with the smallest eigenvalues '
+                             f'to make the minimizer more like the incumbent, until it is feasable.')
+                _, _, H = model.get_model()
+                eigenvalues, eigenvectors = np.linalg.eig(H)
+                order = np.argsort(eigenvalues)
+                idx = 0
+                while not (np.all(x_star >= 0) and np.all(x_star <= 1)) and idx < len(order):
+                    # Do a line search along the eigenvalue with the minimum, unused eigenvalue that
+                    # seeks to minimize the distance between the optimizer and the current incumbent.
+                    res = minimize_scalar(
+                        lambda alpha: np.linalg.norm(x_inc - (x_star + alpha*eigenvectors[order[idx]])))
+                    # Move to the solution closest to the current incumbent
+                    x_star += eigenvectors[order[idx]]*res.x
+                    # Update to the next eigenvalue in case we're still not feasable.
+                    idx += 1
+            if not (np.all(x_star >= 0) and np.all(x_star <= 1)):
+                LOGGER.debug(f'Something went wrong. It is still infeasable: {x_star}')
+            elif np.allclose(x_star, x_inc, rtol=0.01):
+                LOGGER.debug(f'The minimizer ended up being nearly identical to the incumbent, so we will '
+                             f'use the sampling method instead.')
+            else:
+                x_next = x_star
+                LOGGER.debug(f'Now that it is feasable the minimizer is: {x_star}')
+        # Otherwise, sample from around the incumbent a handful of times and use the model to
+        # pick the one expected to be the best.
+        if x_next is None:
+            LOGGER.debug(f'Sampling from a Guassian around the incumbent')
+            # Pick the variance of the Guassian so that it slowly shrinks as we get more data,
+            # focusing us ever-more-tightly around the incumbent.
+            var = (1/n_configs_evaluated + 0.05)**2
+            LOGGER.debug(f'Using a variance of {var}')
+            # Sample n_samples configurations and reject any that are infeasable.
+            LOGGER.debug(f'Sampling {n_samples} configurations for each of the top {top_k} configurations.')
+            X_next = []
+            for idx in np.argpartition(y_train, top_k)[:top_k]:
+                x_top = transformer.transform(X_train[idx])
+                x_next = np.random.multivariate_normal(x_top, cov=np.diag([var]*len(x_inc)), size=n_samples)
+                X_next.append(x_next)
+            x_next = np.concatenate(X_next, axis=0)
+            feasable = np.logical_and(np.all(x_next >= 0, axis=1), np.all(x_next <= 1, axis=1))
+            if np.any(feasable):
+                # Grab the first feasable configurationlgorithm.
+                x_next = x_next[feasable]
+                LOGGER.debug(f'Found {len(x_next)} feasable configurations for the numeric hyperparameters.')
+                x_next = x_next[np.argmin(model.predict(x_next))]
+                LOGGER.debug('Picked the one with the best score predicted by the mdoel.')
+            else:
+                # Sample a random configuration from the unit cube to
+                # help improve the model.
+                x_next = np.random.random(len(x_inc))
+                LOGGER.debug('None of the sampled configurations were feasable. Sampling '
+                             'uniformly at random from the unit cube instead.')
+        x_next = transformer.inverse_transform(x_next)
+        LOGGER.debug(f'The new set of numeric values to evaluate (in the original space) are {x_next}')
+        return x_next
 
-def _get_next_config(model, suggested_optimizer, data, num_vals, transformer, random_fraction, n_samples=5, top_k=3):
-    df = self._data_to_df(data)
-    # Keep only the largest fidelity for each configuration
-    df = df.groupby('ID').tail(1)
-    X_train = np.array(list(df['ID'].map(num_vals))
-    y_train = np.array(df['Loss']) 
-    x_inc = X_train[np.argmin(y_train)]
-    LOGGER.debug(f'The current incumbent is: {x_inc}')
-    x_inc = transformer.transform(x_inc)
-    LOGGER.debug(f'Or, when transformed: {x_inc}')
-    x_next = None
-    # If we haven't yet suggested it, suggest the optimizer of the model
-    if not suggested_optimizer: 
-        x_star = model.get_minimizer()
-        LOGGER.debug(f"The model's minimizer (when encoded) is: {x_star}")
-        # Check if the optimizer if feasable
-        if not (np.all(x_star >= 0) and np.all(x_star <= 1)):
-            LOGGER.debug(f'Since the minimizer is not feasable we are going to progressively '
-                         f'do line searches along the eigenvectors with the smallest eigenvalues '
-                         f'to make the minimizer more like the incumbent, until it is feasable.')
-            _, _, H = model.get_model()
-            eigenvalues, eigenvectors = np.linalg.eig(H)
-            order = np.argsort(eigenvalues)
-            idx = 0
-            while not (np.all(x_star >= 0) and np.all(x_star <= 1)) and idx < len(order):
-                # Do a line search along the eigenvalue with the minimum, unused eigenvalue that
-                # seeks to minimize the distance between the optimizer and the current incumbent.
-                res = minimize_scalar(
-                    lambda alpha: np.linalg.norm(x_inc - (x_star + alpha*eigenvectors[order[idx]])))
-                # Move to the solution closest to the current incumbent
-                x_star += eigenvectors[order[idx]]*res.x
-                # Update to the next eigenvalue in case we're still not feasable.
-                idx += 1
-        if not (np.all(x_star >= 0) and np.all(x_star <= 1)):
-            LOGGER.debug(f'Something went wrong. It is still infeasable: {x_star}')
-        elif np.allclose(x_star, x_inc, rtol=0.01):
-            LOGGER.debug(f'The minimizer ended up being nearly identical to the incumbent, so we will '
-                         f'use the sampling method instead.')
-        else:
-            x_next = x_star
-            LOGGER.debug(f'Now that it is feasable the minimizer is: {x_star}')
-    # Otherwise, sample from around the incumbent a handful of times and use the model to
-    # pick the one expected to be the best.
-    if x_next is None:
-        LOGGER.debug(f'Sampling from a Guassian around the incumbent')
-        # Pick the variance of the Guassian so that it slowly shrinks as we get more data,
-        # focusing us ever-more-tightly around the incumbent.
-        var = (2/len(X_train) + 0.05)**2
-        LOGGER.debug(f'Using a variance of {var}')
-        # Sample n_samples configurations and reject any that are infeasable.
-        LOGGER.debug(f'Sampling {n_samples} configurations for each of the top {top_k} configurations.')
-        X_next = []
-        for idx in np.argpartition(y_train, top_k)[:top_k]:
-            x_top = X_trainn[idx]
-            x_next = np.random.multivariate_normal(x_top, cov=np.diag([var]*len(x_inc)), size=n_samples)
-            X_next.append(x_next)
-        x_next = np.concatenate(X_next, axis=0)
-        feasable = np.logical_and(np.all(x_next >= 0, axis=1), np.all(x_next <= 1, axis=1))
-        if np.any(feasable):
-            # Grab the first feasable configurationlgorithm.
-            x_next = x_next[feasable]
-            LOGGER.debug(f'Found {len(x_next)} feasable configurations for the numeric hyperparameters.')
-            x_next = x_next[np.argmin(model.predict(x_next))]
-            LOGGER.debug('Picked the one with the best score predicted by the mdoel.')
-        else:
-            # Sample a random configuration from the unit cube to
-            # help improve the model.
-            x_next = np.random.random(len(x_inc))
-            LOGGER.debug('None of the sampled configurations were feasable. Sampling '
-                         'uniformly at random from the unit cube instead.')
-    x_next = transformer.inverse_transform(x_next)
-    LOGGER.debug(f'The new set of numeric values to evaluate (in the original space) are {x_next}')
-    return x_next
 
+def _data_to_df(data):
+    df = pd.DataFrame(data, columns=['ID', 'Fidelity', 'Loss'])
+    df = df.sort_values('Fidelity')
+    return df
 
 class Transformer():
     def __init__(self):
         self._lowers = None
         self._uppers = None
         self._integers = None
+        self._logs = None
 
     def fit(self, numeric_hps, config_space):
         lowers = []
         uppers = []
         integers = []
+        logs = []
         for hp in numeric_hps:
             hp = config_space.get_hyperparameter(str(hp))
             lowers.append(hp.lower)
             uppers.append(hp.upper)
             integers.append(isinstance(hp, Integer))
+            logs.append(hp.log)
+        self._integers = np.array(integers)
+        self._logs = np.array(logs)
         self._lowers = np.array(lowers)
         self._uppers = np.array(uppers)
-        self._integers = np.array(integers)
+        self._lowers[self._logs] = np.log(self._lowers[self._logs])
+        self._uppers[self._logs] = np.log(self._uppers[self._logs])
 
     def transform(self, X):
         X = copy.deepcopy(np.array(X))
+        if X.ndim == 1:
+            X[self._logs] = np.log(X[self._logs])
+        elif X.ndim == 2:
+            X[:,self._logs] = np.log(X[:,self._logs])
+        else:
+            raise ValueError(f'Wrong number of dimensions for X in transform(). '
+                             f'Must be 1 or 2, but X has shape {X.shape}')
         X = X - self._lowers
         X = X/(self._uppers-self._lowers)
         return X
@@ -526,7 +551,12 @@ class Transformer():
         X = X*(self._uppers-self._lowers)
         X = X + self._lowers
         if X.ndim == 1:
+            X[self._logs] = np.exp(X[self._logs])
             X[self._integers] = np.round(X[self._integers])
         elif X.ndim == 2:
-            X[:, self._integers] = np.round(X[:, self._integers])
+            X[:,self._logs] = np.exp(X[:,self._logs])
+            X[:,self._integers] = np.round(X[:,self._integers])
+        else:
+            raise ValueError(f'Wrong number of dimensions for X in inverse_transform(). '
+                             f'Must be 1 or 2, but X has shape {X.shape}')
         return X
