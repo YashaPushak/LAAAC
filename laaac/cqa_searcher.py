@@ -2,6 +2,7 @@ import time
 import copy 
 import logging
 from collections import defaultdict
+from multiprocessing import Process, Manager
 
 import numpy as np
 import pandas as pd
@@ -70,14 +71,9 @@ class CQASearcher(Searcher):
       Models will only be retrained once they have at least this factor times
       the total fidelity budget used to evaluate the training data on which the
       last model was fit.
-    lambda_ : float
-      Must be non-negative. Weight of the L1-regularizer used when fitting
-      the general convex quadratic models. (Not used for the separable
-      convex quadratic models.)
-    norm : float
-      The norm used in the objective function of the general convex quadratic
-      models. Note that the separable convex quadratic model always optimizes
-      the L1-norm regardless.
+    max_concurrent_model_fits : int
+      The models are fit in separate python processes. This limits the maximum
+      number of models that can be fit at any one time. Must be at least 1.
     log_location : str | None
       Optionally enables logging to a file.
     log_level : int
@@ -87,8 +83,8 @@ class CQASearcher(Searcher):
     """
     def __init__(self, config_space, metric, max_t, grace_period=1, reduction_factor=4, mode='min',
                  budget='budget', categorical_grace_period=20, failed_result=1, random_fraction=0.5,
-                 wall_time=None, wall_time_budget=None, model_fit_factor=1.5, lambda_=0, norm=1, 
-                 window_size=0, log_location='CQA.log', log_level=logging.DEBUG,
+                 wall_time=None, wall_time_budget=None, model_fit_factor=1.5, 
+                 max_concurrent_model_fits=1, window_size=0, log_location='CQA.log', log_level=logging.DEBUG,
                  log_formatter='%(asctime)s:%(name)s:%(levelname)s: %(message)s', **kwargs):
         super().__init__(metric=metric, mode=mode, **kwargs)
         self._config_space = config_space
@@ -109,12 +105,16 @@ class CQASearcher(Searcher):
         self._configurations = {}
         self._models = {}
         self._suggested_optimizer = defaultdict(bool)  # Initializes to False
-        self._budget_spent = defaultdict(int)  # Initializes to 0
         self._last_model_fidelity = defaultdict(lambda: grace_period)
+        process_manager = Manager()
+        self._model_queue = process_manager.Queue()
+        if max_concurrent_model_fits < 1:
+            raise ValueError(f'max_concurrent_model_fits must be at least 1. '
+                             f'Provided {max_concurrent_model_fits}.')
+        self._max_processes = max_concurrent_model_fits
+        self._processes_running = 0
         self._window_size = window_size
         self._model_fit_factor = model_fit_factor
-        self._lambda = lambda_
-        self._norm = norm
         self._data = {}
         self._num_vals = {}
         self._cat_rewards = defaultdict(list)
@@ -149,6 +149,9 @@ class CQASearcher(Searcher):
             num_hp, num_val, cat_hp, cat_val, cat_key = self._group_hps(config)
             eliminated = cat_key in self._cat_eliminated
             LOGGER.debug(f'This categorical combination has been eliminated? {eliminated}')
+        # Check to see if new models have been fit.
+        if len(num_hp) > 0:
+            self._check_for_models()
         # Now check to see if this combination of categorical values has a model for the
         # numeric hyper-parameters (if any exist)
         if cat_key in self._models and len(num_hp) > 0:
@@ -277,71 +280,81 @@ class CQASearcher(Searcher):
                 self._num_vals[cat_key] = {}
             self._data[cat_key].append((trial_id, budget, loss))
             self._num_vals[cat_key][trial_id] = num_val
-            # Gets the data with the best fidelity available for training,
-            # provied that we have collected enough new data since the last
-            # model fit. 
-            X_train, y_train, budgets, current_fidelity, current_budget_spent = self._get_data_for_training(
-                self._data[cat_key], self._num_vals[cat_key], len(num_val), self._last_model_fidelity[cat_key],
-                self._budget_spent[cat_key])
-            min_n_samples_separable = SCQA.min_samples(len(num_val))
-            if X_train is not None:
-                n_samples = len(X_train)
-                min_n_samples_general = GCQA.min_samples(len(num_val))
-                if n_samples >= min_n_samples_general:
-                    LOGGER.debug('Fitting a general convex quadratic under-estimator model.')
-                    model = GCQA(lambda_=self._lambda, norm=self._norm)
+
+            # Handle any back-log of fitted models so that we know if there
+            # are any free processes available.
+            self._check_for_models()
+            if self._processes_running < self._max_processes:
+                LOGGER.debug(f'The number of processes running {self._processes_running} is less than '
+                             f'the maximum allowed {self._max_processes}, so we are going to initiate '
+                             f'a new model-fitting process.')
+                # Gets the data with the best fidelity available for training,
+                # provied that we have collected enough new data since the last
+                # model fit. 
+                X_train, y_train, budgets, current_fidelity = self._get_data_for_training(
+                    self._data[cat_key], self._num_vals[cat_key], len(num_val), self._last_model_fidelity[cat_key])
+                min_n_samples_separable = SCQA.min_samples(len(num_val))
+                if X_train is not None:
+                    # Transform the numeric hyper-parameters to a unit cube
+                    if cat_key not in self._transformers:
+                        transformer = Transformer()
+                        transformer.fit(num_hp, self._config_space)
+                        self._transformers[cat_key] = transformer
+                    X_train = self._transformers[cat_key].transform(X_train)
+                    LOGGER.debug('Transformed X_train:')
+                    LOGGER.debug(X_train)
+                    # Scale the losses so that the constraints on the parameters
+                    # in the model don't make the optimal solution infeasable
+                    y_transformer = RobustScaler()
+                    y_train_untransformed = y_train
+                    y_train = y_transformer.fit_transform(y_train.reshape(-1, 1)).squeeze()
+                    LOGGER.debug('Transformed y_train:')
+                    LOGGER.debug(y_train)
+                    LOGGER.debug('Sample_weights (fidelity budgets):')
+                    LOGGER.debug(budgets)
+                    p = Process(target=fit_model,
+                                args=(X_train, y_train, budgets, self._model_queue, 
+                                      cat_key, y_transformer, current_fidelity))
+                    p.start()
+                    self._processes_running += 1
+                    LOGGER.debug(f'We now have {self._processes_running} model processes running.')
+            else:
+                LOGGER.debug(f'There were too many processes running {self._processes_running} to '
+                             f'start another one because the maximum allowed processes is '
+                             f'{self._max_processes}')
+    
+    def _check_for_models(self):
+        while self._model_queue.qsize() > 0:
+            success_, model_type, model_dict, X_train, y_train, budgets, args = self._model_queue.get()
+            cat_key, y_transformer, current_fidelity = args
+            self._processes_running -= 1
+            LOGGER.debug('Found a new result in the model queue.')
+            LOGGER.debug(f'We now have {self._processes_running} model processes running.')
+            if success_:
+                LOGGER.debug(f'It was a successful model fit for {cat_key}')
+                model = GCQA() if model_type == 'GCQA' else SCQA()
+                model.from_dict(model_dict)
+                y_train = y_transformer.inverse_transform(y_train.reshape((-1, 1))).squeeze()
+                if cat_key in self._models:
+                    old_pred = self._y_transformers[cat_key].inverse_transform(
+                        self._models[cat_key].predict(X_train).reshape((-1, 1))).squeeze()
+                    old_score = np.mean(np.abs(old_pred - y_train)*budgets)/np.sum(budgets)
                 else:
-                    LOGGER.debug(f'Number of training examples is less than the minimum number '
-                                 f'({min_n_samples_general}) required to fit a general convex '
-                                 f'quadratic model, so we are fitting a separable one instead.')
-                    model = SCQA()
-                # Transform the numeric hyper-parameters to a unit cube
-                if cat_key not in self._transformers:
-                    transformer = Transformer()
-                    transformer.fit(num_hp, self._config_space)
-                    self._transformers[cat_key] = transformer
-                X_train = self._transformers[cat_key].transform(X_train)
-                LOGGER.debug('Transformed X_train:')
-                LOGGER.debug(X_train)
-                # Scale the losses so that the constraints on the parameters
-                # in the model don't make the optimal solution infeasable
-                y_transformer = RobustScaler()
-                y_train_untransformed = y_train
-                y_train = y_transformer.fit_transform(y_train.reshape(-1, 1)).squeeze()
-                LOGGER.debug('Transformed y_train:')
-                LOGGER.debug(y_train)
-                LOGGER.debug('Sample_weights (fidelity budgets):')
-                LOGGER.debug(budgets)
-                try:
-                    model.fit(X_train, y_train, sample_weight=budgets)
-                    LOGGER.debug('Successfully fit the model.')
-                    # Make sure the new model hasn't diverged to something worse
-                    # than the old one
-                    if cat_key in self._models:
-                        old_pred = self._y_transformers[cat_key].inverse_transform(
-                            self._models[cat_key].predict(X_train).reshape((-1, 1))).squeeze()
-                        old_score = np.mean(np.abs(old_pred - y_train_untransformed)*budgets)/np.sum(budgets)
-                    else:
-                        old_score = None
-                    new_pred = y_transformer.inverse_transform(model.predict(X_train).reshape((-1, 1))).squeeze()
-                    new_score = np.mean(np.abs(new_pred - y_train_untransformed)*budgets)/np.sum(budgets)
-                    LOGGER.debug(f'The MAE of the new model is {new_score}')
-                    LOGGER.debug(f'The MAE of the old model is {old_score}')
-                    if old_score is None or new_score <= old_score:
-                        self._models[cat_key] = model
-                        self._y_transformers[cat_key] = y_transformer
-                        self._suggested_optimizer[cat_key] = False
-                        self._last_model_fidelity[cat_key] = current_fidelity
-                        LOGGER.debug('Accepted the new model.')
-                    else:
-                        LOGGER.debug('Rejected the new model; keeping the old one for now.')
-                except Exception as e:
-                    # Something went wrong. Don't update the model.
-                    LOGGER.debug('Something went wrong with the model fitting and scoring process, '
-                                 'falling back on the previous model, if available.', exc_info=e)
-                # Update the model weight even if something failed, so we don't get stuck wasting
-                # Time constantly trying to re-build this model when the data has hardly changed/
-                self._budget_spent[cat_key] = current_budget_spent
+                    old_score = None
+                new_pred = y_transformer.inverse_transform(model.predict(X_train).reshape((-1, 1))).squeeze()
+                new_score = np.mean(np.abs(new_pred - y_train)*budgets)/np.sum(budgets)
+                LOGGER.debug(f'The MAE of the new model is {new_score}')
+                LOGGER.debug(f'The MAE of the old model is {old_score}')
+                if old_score is None or new_score <= old_score:
+                    self._models[cat_key] = model
+                    self._y_transformers[cat_key] = y_transformer
+                    self._suggested_optimizer[cat_key] = False
+                    self._last_model_fidelity[cat_key] = current_fidelity
+                    LOGGER.debug('Accepted the new model.')
+                else:
+                    LOGGER.debug('Rejected the new model; keeping the old one for now.')
+            else:
+                LOGGER.debug(f'It was an unsuccessful model fit for {cat_key}')
 
     def _get_data_in_window(self, df, fidelity, window_size):
         window = np.logical_and(fidelity <= df['Fidelity'], 
@@ -350,36 +363,26 @@ class CQASearcher(Searcher):
         data_in_window = df[window].groupby('ID').tail(1)
         return data_in_window
 
-    def _get_data_for_training(self, data, num_vals, n_dim, fidelity, last_budget_spent):
+    def _get_data_for_training(self, data, num_vals, n_dim, fidelity):
         # Setup
         min_n_samples_separable = SCQA.min_samples(n_dim)
         last_data = None
         df = _data_to_df(data)
-        # We only fit a new model if the sum of the fidelity budgets has increased by an
-        # exponential factor.
-        budget_spent = df.groupby('ID').tail(1)['Fidelity'].sum()
-        budget_needed = last_budget_spent*self._model_fit_factor
-        if budget_spent >= budget_needed:
+        data_in_window = self._get_data_in_window(df, fidelity, self._window_size)
+        LOGGER.debug(f'Checking to find the largest fidelity budget window with sufficient data '
+                     f'to fit a model. '
+                     f'Minimum number of training examples to fit model: {min_n_samples_separable}')
+        LOGGER.debug(f'Budget fidelity window {fidelity} to '
+                     f'{fidelity*self._reduction_factor**self._window_size} has '
+                     f'{len(data_in_window)} data samples available.')
+        # Make the window as large as possible while there is still enough data.
+        while len(data_in_window) >= min_n_samples_separable:
+            last_data = data_in_window
+            fidelity *= self._reduction_factor
             data_in_window = self._get_data_in_window(df, fidelity, self._window_size)
-            LOGGER.debug(f'Checking to find the largest fidelity budget window with sufficient data '
-                         f'to fit a model. '
-                         f'Minimum number of training examples to fit model: {min_n_samples_separable}')
             LOGGER.debug(f'Budget fidelity window {fidelity} to '
                          f'{fidelity*self._reduction_factor**self._window_size} has '
                          f'{len(data_in_window)} data samples available.')
-            # Make the window as large as possible while there is still enough data.
-            while len(data_in_window) >= min_n_samples_separable:
-                last_data = data_in_window
-                fidelity *= self._reduction_factor
-                data_in_window = self._get_data_in_window(df, fidelity, self._window_size)
-                LOGGER.debug(f'Budget fidelity window {fidelity} to '
-                             f'{fidelity*self._reduction_factor**self._window_size} has '
-                             f'{len(data_in_window)} data samples available.')
-        else:
-            LOGGER.debug(f'Skipping model fitting because the available training '
-                         f'data has used a combined fidelity budget of '
-                         f'{budget_spent}, which is less than the required amount: '
-                         f'{budget_needed}')
 
         # We only fit a new model if we found a window with enough data        
         if last_data is not None:
@@ -391,7 +394,7 @@ class CQASearcher(Searcher):
             X_train = None
             y_train = None
             budgets = None
-        return X_train, y_train, budgets, fidelity, budget_spent
+        return X_train, y_train, budgets, fidelity
            
     def _group_hps(self, config):
         numeric = []
@@ -506,6 +509,34 @@ def _data_to_df(data):
     df = pd.DataFrame(data, columns=['ID', 'Fidelity', 'Loss'])
     df = df.sort_values('Fidelity')
     return df
+
+
+def fit_model(X_train, y_train, budgets, queue, *extra_args):
+    LOGGER.debug('A model fitting process is starting')
+    n_samples = len(X_train)
+    min_n_samples_general = GCQA.min_samples(X_train.shape[1])
+    if n_samples >= min_n_samples_general:
+        LOGGER.debug('Fitting a general convex quadratic under-estimator model.')
+        model = GCQA()
+        model_type = 'GCQA'
+    else:
+        LOGGER.debug(f'Number of training examples is less than the minimum number '
+                     f'({min_n_samples_general}) required to fit a general convex '
+                     f'quadratic model, so we are fitting a separable one instead.')
+        model = SCQA()
+        model_type = 'SCQA'
+    success_ = False
+    try:
+        model.fit(X_train, y_train, sample_weight=budgets)
+        success_ = True
+        LOGGER.debug('Successfully fit the model.')
+    except Exception as e:
+        # Something went wrong. Don't update the model.
+        LOGGER.debug('Something went wrong with the model fitting and scoring process, '
+                     'falling back on the previous model, if available.', exc_info=e)
+    model_dict = model.to_dict()
+    queue.put((success_, model_type, model_dict, X_train, y_train, budgets, extra_args))
+
 
 class Transformer():
     def __init__(self):

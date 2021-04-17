@@ -12,6 +12,7 @@ class CQA(metaclass=abc.ABCMeta):
         self._res = None
         self._n = None
         self._norm = norm
+        self._attrs_to_save = ['_res', '_n', '_norm']
         
     @abc.abstractmethod
     def fit(self, X, y, sample_weight=None):
@@ -24,6 +25,16 @@ class CQA(metaclass=abc.ABCMeta):
     @abc.abstractmethod
     def get_model(self):
         pass
+
+    def to_dict(self):
+        attr_dict = {}
+        for attr in self._attrs_to_save:
+            attr_dict[attr] = getattr(self, attr)
+        return attr_dict
+
+    def from_dict(self, attr_dict):
+        for attr, value in attr_dict.items():
+            setattr(self, attr, value)
 
     def get_minimizer(self):
         self._verify_fit('get_minimizer')
@@ -83,6 +94,7 @@ class AutoCQA(CQA):
     def __init__(self, norm=1, eps=1e-6):
         self._eps = eps
         super().__init__(norm)
+        self._attrs_to_save.append('_eps')
 
     def fit(self, X, y, sample_weight=None, X_val=None, y_val=None):
         self._verify_X_y_w(X, y, sample_weight)
@@ -121,7 +133,8 @@ class GCQA(CQA):
         self._eps = eps
         self._prefit_model = None
         self._lambda = lambda_
-        super().__init__(norm) 
+        super().__init__(norm)
+        self._attrs_to_save.extend(['_method', '_eps', '_prefit_model', '_lambda'])
 
     def fit(self, X, y, sample_weight=None):
         self._verify_X_y_w(X, y, sample_weight)
