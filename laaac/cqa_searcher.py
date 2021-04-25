@@ -115,6 +115,7 @@ class CQASearcher(Searcher):
         self._processes_running = 0
         self._window_size = window_size
         self._model_fit_factor = model_fit_factor
+        self._try_moonshots = False
         self._data = {}
         self._num_vals = {}
         self._cat_rewards = defaultdict(list)
@@ -442,7 +443,7 @@ class CQASearcher(Searcher):
         LOGGER.debug(f'Or, when transformed: {x_inc}')
         x_next = None
         # If we haven't yet suggested it, suggest the optimizer of the model
-        if not suggested_optimizer: 
+        if self._try_moonshots and not suggested_optimizer: 
             x_star = model.get_minimizer()
             LOGGER.debug(f"The model's minimizer (when encoded) is: {x_star}")
             # Check if the optimizer if feasable
@@ -477,7 +478,10 @@ class CQASearcher(Searcher):
             LOGGER.debug(f'Sampling from a Guassian around the incumbent')
             # Pick the variance of the Guassian so that it slowly shrinks as we get more data,
             # focusing us ever-more-tightly around the incumbent.
-            var = (1/n_configs_evaluated + 0.05)**2
+            #var = (0.25/n_configs_evaluated**0.5 + 0.01)**2
+            # One standard deviation from the mean covers 10% of each parameter's range.
+            var = (0.05)**2
+            # TODO: Cleanup and expose this as a parameter
             LOGGER.debug(f'Using a variance of {var}')
             # Sample n_samples configurations and reject any that are infeasable.
             LOGGER.debug(f'Sampling {n_samples} configurations for each of the top {top_k} configurations.')
