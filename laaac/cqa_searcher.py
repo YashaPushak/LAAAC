@@ -147,7 +147,9 @@ class CQASearcher(Searcher):
         eliminated = True
         LOGGER.debug('********** Suggesting a Configuration **********')
         if self._cat:
-            cat_id = self._cat_bfasha.suggest()
+            # Together, the cat and num IDs form a unique id from the
+            # perspective of categorical BF-ASHA
+            cat_id, num_id = self._cat_bfasha.suggest()
             if cat_id not in self._cat_id_to_key:
                 LOGGER.debug('BF-ASHA recommends we try evaluating a new set of '
                              'categorical values. Attempting to find one with '
@@ -177,9 +179,10 @@ class CQASearcher(Searcher):
                                  'new categorical values to evaluate. So we are telling '
                                  'BF-ASHA not to suggest anything new anymore.')
                     self._cat_bfasha.no_new_suggestions()
-                    cat_id = self._cat_bfasha.suggest()
+                    cat_id, num_id = self._cat_bfasha.suggest()
             # Look up the configuration by its cat id.
             config = self._cat_id_to_config[cat_id]
+            self._trial_id_to_cat_num_id = (cat, num_id)
         else:
             # There are no categorical hyper-parameters; however, the next
             # part of the code assumes that a configuration has been selected
@@ -255,8 +258,9 @@ class CQASearcher(Searcher):
             self._cat_rewards[cat_key][num_val] = loss
             # Find the best loss observed for this arm.
             best_loss = min(list(self._cat_rewards[cat_key].values()))
+            cat_id, num_id = self._trial_id_to_cat_num_id[trial_id]
             # Report the value back to BF-ASHA
-            self._cat_bfasha.report(self._cat_key_to_id[cat_key], best_loss)
+            self._cat_bfasha.report(cat_id, num_id, best_loss)
         # We don't need to  update this model if this categorical combination has no
         # numeric hyperparameters.
         if len(num_hp) > 0:

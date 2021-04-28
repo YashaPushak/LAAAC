@@ -14,7 +14,7 @@ class BFASHA:
                             (grace_period, {}),
                             (0, {})]  # Dumby milestone
         self._released = defaultdict(list)
-        self._times_suggested = defaultdict(int)
+        self._times_suggested = defaultdict(set)
         self._times_reported = defaultdict(int)
         self._next_id = 0
 
@@ -68,12 +68,18 @@ class BFASHA:
         if self._times_suggested[id_to_run] >= self._milestones[1][0]:
             self._milestones.insert(0, (self._milestones[0][0]*self._reduction_factor, {}))
             self._grace_period_index += 1
-        return id_to_run
+        # Return the id to run, as well as the number of times it was suggested
+        # since each time an id is suggested we can get multiple reports and we
+        # need to know to which one a report corresponds.
+        return id_to_run, self._times_suggested[id_to_run]
 
-    def report(self, config_id, loss):
+    def report(self, config_id, time_suggested, loss):
         logging.debug(f'Catgoerical config_id: {config_id}; loss {loss}')
-        self._times_reported[config_id] += 1
-        fidelity = self._times_reported[config_id]
+        self._times_reported[config_id].add(time_suggested)
+        # The fidelity of a categorical arm is number of unique
+        # numeric value configurations for which we have observed
+        # a report of any level of fidelity.
+        fidelity = len(self._times_reported[config_id])
         for milestone, recorded in self._milestones:
             if fidelity < milestone or config_id in recorded:
                 continue
