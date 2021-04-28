@@ -414,6 +414,8 @@ def _L_ij(n):
 
 def _q(x, args, eps=1e-3):
     x = np.array(x).squeeze()
+    if x.ndim == 0:
+       x = x.reshape((-1))
     c0, c, l = _args_to_parts(args, len(x))
     H = _hessian(l, len(x), eps=eps)
     return c0 + np.dot(c.reshape((1,-1)), x) + 0.5*np.linalg.multi_dot([x.reshape((1, -1)), H, x.reshape((-1, 1))])

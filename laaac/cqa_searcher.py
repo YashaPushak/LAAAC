@@ -13,9 +13,11 @@ from ray.tune.suggest import Searcher
 
 from ConfigSpace.hyperparameters import UniformFloatHyperparameter as Float
 from ConfigSpace.hyperparameters import UniformIntegerHyperparameter as Integer
+from ConfigSpace.hyperparameters import CategoricalHyperparameter as Categorical
 from ConfigSpace import Configuration
 
 from .cqa import SCQA, GCQA
+from .bfasha import BFASHA
 
 LOGGER = logging.getLogger('CQA')
 
@@ -43,10 +45,6 @@ class CQASearcher(Searcher):
       The name of the key in the dict of the results from the trainable that
       tracks the fidelity/budget upon which the configuration has been
       evaluated so far.
-    categorical_grace_period : int
-      The minimum number of results that must have been reported -- summed over
-      all configurations with a given set of categorical values --  before that
-      set of categorical values may be eliminated from consideration.
     failed_result : 1
       The value for metric that is to be assumed if the result is not reported,
       is reported as nan, or is reported as non-finite.
@@ -82,7 +80,7 @@ class CQASearcher(Searcher):
       A log formatter or None to use the default.
     """
     def __init__(self, config_space, metric, max_t, grace_period=1, reduction_factor=4, mode='min',
-                 budget='budget', categorical_grace_period=20, failed_result=1, random_fraction=0.5,
+                 budget='budget', failed_result=1, random_fraction=0.5,
                  wall_time=None, wall_time_budget=None, model_fit_factor=1.5, 
                  max_concurrent_model_fits=1, window_size=0, log_location='CQA.log', log_level=logging.DEBUG,
                  log_formatter='%(asctime)s:%(name)s:%(levelname)s: %(message)s', **kwargs):
@@ -118,11 +116,18 @@ class CQASearcher(Searcher):
         self._try_moonshots = False
         self._data = {}
         self._num_vals = {}
-        self._cat_rewards = defaultdict(list)
-        self._cat_times = defaultdict(list)
-        self._cat_eliminated = []
-        self._cat_candidates = set([])
-        self._categorical_grace_period = categorical_grace_period
+        self._cat_rewards = defaultdict(dict)
+        # TODO: Expose parameters
+        self._cat_bfasha = BFASHA(grace_period=1, reduction_factor=8)
+        self._cat_id_to_key = {}
+        self._cat_key_to_id = {}
+        self._cat_id_to_config = {}
+        # Check to see if there are any categorical hyperparameters at all.
+        self._cat = False
+        for hp in config_space.get_hyperparameters():
+            if isinstance(hp, Categorical):
+                self._cat = True
+                break
         self._transformers = {}
         self._y_transformers = defaultdict(RobustScaler)
         if log_location is not None:
@@ -141,32 +146,76 @@ class CQASearcher(Searcher):
     def suggest(self, trial_id):
         eliminated = True
         LOGGER.debug('********** Suggesting a Configuration **********')
-        while eliminated:
+        if self._cat:
+            cat_id = self._cat_bfasha.suggest()
+            if cat_id not in self._cat_id_to_key:
+                LOGGER.debug('BF-ASHA recommends we try evaluating a new set of '
+                             'categorical values. Attempting to find one with '
+                             'random sampling')
+                for _ in range(50):
+                    config_obj = self._config_space.sample_configuration()
+                    # Convert to a dict to work with internally
+                    config = dict(config_obj)
+                    # Check to see if this combination of categorical values has been seen before
+                    num_hp, num_val, cat_hp, cat_val, cat_key = self._group_hps(config)
+                    if cat_key not in self._cat_key_to_id:
+                        LOGGER.debug('We found a new set of categorical values to try.')
+                        # We found a new categorical combination!
+                        # BFASHA assigns its own ids, so create a mapping here.
+                        self._cat_id_to_key[cat_id] = cat_key
+                        self._cat_key_to_id[cat_key] = cat_id
+                        self._cat_id_to_config[cat_id] = config_obj
+                        break
+                else:
+                    # We failed to find a new categorical configuration.
+                    # We searched by random sampling so it's possible that
+                    # there might still be some out there but we don't want
+                    # to waste our time searching for ever, so we'll assume
+                    # that there are none. Tell BFASHA to increase its grace
+                    # period and give us a new suggestion.
+                    LOGGER.debug('After several failed attempts, we did not find any '
+                                 'new categorical values to evaluate. So we are telling '
+                                 'BF-ASHA not to suggest anything new anymore.')
+                    self._cat_bfasha.no_new_suggestions()
+                    cat_id = self._cat_bfasha.suggest()
+            # Look up the configuration by its cat id.
+            config = self._cat_id_to_config[cat_id]
+        else:
+            # There are no categorical hyper-parameters; however, the next
+            # part of the code assumes that a configuration has been selected
+            # and then it over-writes the numeric-values of the parameters if
+            # there are any, so we will simple sample some random values
             config = self._config_space.sample_configuration()
-            LOGGER.debug(f'Sampled a new {config}')
-            # Convert to a dict to work with internally
-            config = dict(config)
-            # Check to see if this combination of categorical values has been eliminated
-            num_hp, num_val, cat_hp, cat_val, cat_key = self._group_hps(config)
-            eliminated = cat_key in self._cat_eliminated
-            LOGGER.debug(f'This categorical combination has been eliminated? {eliminated}')
+        LOGGER.debug(f'Selected a configuration with some categorical values: {config}')
+        # Convert to a dict to work with internally
+        config = dict(config)
+        num_hp, num_val, cat_hp, cat_val, cat_key = self._group_hps(config)
         # Check to see if new models have been fit.
         if len(num_hp) > 0:
             self._check_for_models()
-        # Now check to see if this combination of categorical values has a model for the
-        # numeric hyper-parameters (if any exist)
-        if cat_key in self._models and len(num_hp) > 0:
-            LOGGER.debug('Found a model for the numeric hyperparameters of the configuration.')
-            # Get the model for these categorical_values.
-            model = self._models[cat_key]
-            # And get a configuration for the numerical parameters predicted to be of high quality
-            num_val = self._get_next_config(
-                model, self._suggested_optimizer[cat_key], 
-                self._data[cat_key], self._num_vals[cat_key],
-                self._transformers[cat_key], self._random_fraction,
-                self._last_model_fidelity[cat_key])
-            # If it wasn't already suggested, then we're about to.
-            self._suggested_optimizer[cat_key] = True
+            # Now check to see if this combination of categorical values has a model for the
+            # numeric hyper-parameters (if any exist)
+            if cat_key in self._models:
+                LOGGER.debug('Found a model for the numeric hyperparameters of the configuration.')
+                # Get the model for these categorical_values.
+                model = self._models[cat_key]
+                # And get a configuration for the numerical parameters predicted to be of high quality
+                num_val = self._get_next_config(
+                    model, self._suggested_optimizer[cat_key], 
+                    self._data[cat_key], self._num_vals[cat_key],
+                    self._transformers[cat_key], self._random_fraction,
+                    self._last_model_fidelity[cat_key])
+                # If it wasn't already suggested, then we're about to.
+                self._suggested_optimizer[cat_key] = True
+            else:
+                # Transform the numeric hyper-parameters to a unit cube
+                if cat_key not in self._transformers:
+                    transformer = Transformer()
+                    transformer.fit(num_hp, self._config_space)
+                    self._transformers[cat_key] = transformer
+                num_val = np.random.random(len(num_val))
+                LOGGER.debug('Sampling a new set of numeric values at random.')
+                num_val = self._transformers[cat_key].inverse_transform(num_val)
             config = self._to_configuration(num_hp, num_val, cat_hp, cat_val)
         # Convert to a Configuration for pretty printing
         configuration = Configuration(self._config_space, config)
@@ -199,80 +248,18 @@ class CQASearcher(Searcher):
         LOGGER.info(f'Corresponding configuration: {config}')
         num_hp, num_val, cat_hp, cat_val, cat_key = self._group_hps(config)
 
-        # If this set of categorical values has already been eliminated, we 
-        # don't need to update the cat rewards for it
-        if cat_key not in self._cat_eliminated and len(cat_hp) > 0:
-            LOGGER.debug('********** Starting Rising Bandits **********')
-            ### Rising Bandits
-            # Update the reward and time for this combination of categorical values
-            if len(self._cat_rewards[cat_key]) > 0:
-                self._cat_rewards[cat_key].append(min(loss, self._cat_rewards[cat_key][-1]))
-            else:
-                self._cat_rewards[cat_key].append(loss)
-            if self._wall_time is not None and self._wall_time in result:
-                self._cat_times[cat_key].append(result[self._wall_time])
-    
-            # Create a helper for extracting cat speed and other data
-            def _extract(cat_rewards, cat_times):
-                current_pull = len(cat_rewards)
-                previous_pull = int(current_pull/2)
-                current_reward = cat_rewards[-1]
-                previous_reward = cat_rewards[-1]
-                # Linearize over the most recent half of the reward data
-                speed = (current_reward - previous_reward)/(current_pull - previous_pull)
-                # Get the mean time spent
-                time_cost = np.mean(cat_times) if len(cat_times) > 0 else None
-                return speed, current_reward, current_pull, time_cost
-    
-            # Get the number of times we have pulled this categorical arm
-            if len(self._cat_rewards[cat_key]) >= self._categorical_grace_period:
-                LOGGER.debug('Current cat rewards:')
-                LOGGER.debug(self._cat_rewards)
-                # Get the current reward, the speed of improvement, and the number of pulls
-                cat_speed, cat_reward, cat_n_pulls, cat_mean_time = _extract(
-                    self._cat_rewards[cat_key], self._cat_times[cat_key])
-                LOGGER.debug(f'Current arm reward {cat_reward} after {cat_n_pulls} pulls '
-                             f'with speed {cat_speed} per {cat_mean_time}')
-                # Compare the expected future reward to each other candidate
-                for other_key in self._cat_rewards:
-                    if (len(self._cat_rewards[other_key]) > self._categorical_grace_period 
-                        and other_key not in self._cat_eliminated):
-                        # Do the same linearization of the reward
-                        other_speed, other_reward, other_n_pulls, other_mean_time = _extract(
-                            self._cat_rewards[other_key], self._cat_times[other_key])
-                        LOGGER.debug(f'Other arm reward {other_reward} after {other_n_pulls} pulls '
-                                     f'with speed {other_speed} per {other_mean_time}')
-                        if (cat_mean_time is not None
-                            and other_mean_time is not None
-                            and self._wall_time_budget is not None):
-                            # Calculate the estimated upper bound for the amount of time remaining.
-                            time_remaining = self._wall_time_budget - (time.time() - self._start_time)
-                            LOGGER.debug(f'Approximately {time_remaining:.2f} seconds remaining')
-                            cat_lower = cat_reward + cat_speed*time_remaining/cat_mean_time
-                            other_lower = other_reward + other_speed*time_remaining/other_mean_time
-                        else:
-                            # Calculate the upper bound on each at 2*max_n_pulls steps
-                            future_n_pulls = 2*max(cat_n_pulls, other_n_pulls)
-                            LOGGER.debug(f'Assuming {future_n_pulls/2} pulls as a total budget')
-                            cat_lower = cat_reward + cat_speed*(future_n_pulls - cat_n_pulls)
-                            other_lower = other_reward + other_speed*(future_n_pulls - other_n_pulls)
-                        LOGGER.debug(f'Estimated bound on future reward for current arm: {cat_lower}')
-                        LOGGER.debug(f'Estimated bound on future reward for other arm:   {other_lower}')
-                        if cat_reward < other_lower:
-                            # Eliminate other
-                            self._cat_eliminated.append(other_key)
-                            LOGGER.debug('Eliminated the other arm')
-                        elif other_reward < cat_lower:
-                            # Eliminate cat
-                            self._cat_eliminated.append(cat_key)
-                            LOGGER.debug('Eliminated the current arm')
-                            # It's unlikely this will eliminate anything else.
-                            break
-        # If this set of categorical values has now been elminated, we also
-        # don't need to update the model for its numeric data. We also don't
-        # need tup update this model if this categorical combination has no
+        if self._cat:
+            LOGGER.debug('********** Reporting a result to the categorical BF-ASHA **********')
+            ### Categorical BF-ASHA
+            # Update the loss for this set of numeric values
+            self._cat_rewards[cat_key][num_val] = loss
+            # Find the best loss observed for this arm.
+            best_loss = min(list(self._cat_rewards[cat_key].values()))
+            # Report the value back to BF-ASHA
+            self._cat_bfasha.report(self._cat_key_to_id[cat_key], best_loss)
+        # We don't need to  update this model if this categorical combination has no
         # numeric hyperparameters.
-        if cat_key not in self._cat_eliminated and len(num_hp) > 0:
+        if len(num_hp) > 0:
             ### Quadratic Model Approximation
             LOGGER.debug('********** Quadratic Model Approximation **********')
             # Accumulate the numeric data for this set of categorical values 
@@ -296,11 +283,6 @@ class CQASearcher(Searcher):
                     self._data[cat_key], self._num_vals[cat_key], len(num_val), self._last_model_fidelity[cat_key])
                 min_n_samples_separable = SCQA.min_samples(len(num_val))
                 if X_train is not None:
-                    # Transform the numeric hyper-parameters to a unit cube
-                    if cat_key not in self._transformers:
-                        transformer = Transformer()
-                        transformer.fit(num_hp, self._config_space)
-                        self._transformers[cat_key] = transformer
                     X_train = self._transformers[cat_key].transform(X_train)
                     LOGGER.debug('Transformed X_train:')
                     LOGGER.debug(X_train)
