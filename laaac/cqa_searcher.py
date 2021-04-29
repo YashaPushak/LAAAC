@@ -3,13 +3,18 @@ import copy
 import logging
 from collections import defaultdict
 from multiprocessing import Process, Manager
+from contextlib import contextmanager
 
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize_scalar
 from sklearn.preprocessing import RobustScaler
 
-from ray.tune.suggest import Searcher
+try:
+    from ray.tune.suggest import Searcher
+    ray_available = True
+except:
+    ray_available = False
 
 from ConfigSpace.hyperparameters import UniformFloatHyperparameter as Float
 from ConfigSpace.hyperparameters import UniformIntegerHyperparameter as Integer
@@ -21,7 +26,42 @@ from .bfasha import BFASHA
 
 LOGGER = logging.getLogger('CQA')
 
-class CQASearcher(Searcher):
+
+@contextmanager
+def exception_logging():
+    try:
+        yield
+    except Exception as e:
+        LOGGER.error('An exception occured.', exc_info=e)
+        raise e
+    finally:
+        pass
+
+
+if ray_available:
+    class CQASearcher(Searcher):
+        """
+        A ray.tune.Searcher wrapper around CoreCQASearcher
+        
+        See CoreCQASearcher.
+        """
+        def __init__(self, config_space, metric, max_t, *args, mode='min', **kwargs):
+            LOGGER.debug('Initializing CQASearcher')
+            super().__init__(metric=metric, mode=mode, **kwargs)
+            LOGGER.debug('called super().__init__')
+            self._cqa = CoreCQASearcher(config_space, metric, max_t, *args, mode=mode, **kwargs)
+    
+        def suggest(self, *args, **kwargs):
+            self._cqa.suggest(*args, **kwargs)
+    
+        def on_trial_result(self, *args, **kwargs):
+            self._cqa.on_trial_result(self, *args, **kwargs)
+    
+        def on_trial_complete(self, *args, **kwargs):
+            self._cqa.on_trial_complete(self, *args, **kwargs) 
+
+
+class CoreCQASearcher:
     """
     Parameters
     ----------
@@ -79,12 +119,24 @@ class CQASearcher(Searcher):
     log_formatter : logging.Formatter | str | None
       A log formatter or None to use the default.
     """
+    @exception_logging()
     def __init__(self, config_space, metric, max_t, grace_period=1, reduction_factor=4, mode='min',
                  budget='budget', failed_result=1, random_fraction=0.5,
                  wall_time=None, wall_time_budget=None, model_fit_factor=1.5, 
                  max_concurrent_model_fits=1, window_size=0, log_location='CQA.log', log_level=logging.DEBUG,
                  log_formatter='%(asctime)s:%(name)s:%(levelname)s: %(message)s', **kwargs):
-        super().__init__(metric=metric, mode=mode, **kwargs)
+        #if log_location is not None:
+        #    fh = logging.FileHandler(log_location)
+        #    fh.setLevel(log_level)
+        #    if log_formatter is not None:
+        #        if isinstance(log_formatter, str):
+        #            log_formatter = logging.Formatter(log_formatter)
+        #        fh.setFormatter(log_formatter)
+        #    LOGGER.addHandler(fh)
+        #LOGGER.setLevel(log_level)
+        LOGGER.debug('**************************************************')
+        LOGGER.debug('********** Initializing the CQA Searcher **********')
+        LOGGER.debug('**************************************************')
         self._config_space = config_space
         self._metric = metric
         self._mode = mode
@@ -103,7 +155,7 @@ class CQASearcher(Searcher):
         self._configurations = {}
         self._models = {}
         self._suggested_optimizer = defaultdict(bool)  # Initializes to False
-        self._last_model_fidelity = defaultdict(lambda: grace_period)
+        self._last_model_fidelity = defaultdict(lambda: None)
         process_manager = Manager()
         self._model_queue = process_manager.Queue()
         if max_concurrent_model_fits < 1:
@@ -122,6 +174,7 @@ class CQASearcher(Searcher):
         self._cat_id_to_key = {}
         self._cat_key_to_id = {}
         self._cat_id_to_config = {}
+        self._trial_id_to_cat_num_id = {}
         # Check to see if there are any categorical hyperparameters at all.
         self._cat = False
         for hp in config_space.get_hyperparameters():
@@ -130,19 +183,11 @@ class CQASearcher(Searcher):
                 break
         self._transformers = {}
         self._y_transformers = defaultdict(RobustScaler)
-        if log_location is not None:
-            fh = logging.FileHandler(log_location)
-            fh.setLevel(log_level)
-            if log_formatter is not None:
-                if isinstance(log_formatter, str):
-                    log_formatter = logging.Formatter(log_formatter)
-                fh.setFormatter(log_formatter)
-            LOGGER.addHandler(fh)
-        LOGGER.setLevel(log_level)
         LOGGER.debug('**************************************************')
         LOGGER.debug('********** Initialized the CQA Searcher **********')
         LOGGER.debug('**************************************************')
 
+    @exception_logging()
     def suggest(self, trial_id):
         eliminated = True
         LOGGER.debug('********** Suggesting a Configuration **********')
@@ -182,7 +227,7 @@ class CQASearcher(Searcher):
                     cat_id, num_id = self._cat_bfasha.suggest()
             # Look up the configuration by its cat id.
             config = self._cat_id_to_config[cat_id]
-            self._trial_id_to_cat_num_id = (cat, num_id)
+            self._trial_id_to_cat_num_id[trial_id] = (cat_id, num_id)
         else:
             # There are no categorical hyper-parameters; however, the next
             # part of the code assumes that a configuration has been selected
@@ -227,12 +272,14 @@ class CQASearcher(Searcher):
         self._configurations[trial_id] = config
         return config
 
+    @exception_logging()
     def on_trial_complete(self, trial_id, result, **kwargs):
         # The result can be None if an error occurred.
         if result is not None:
             self.on_trial_result(trial_id, result)
 
-    def on_trial_result(self, trial_id, result):
+    @exception_logging()
+    def on_trial_result(self, trial_id, result, update_model=True):
         LOGGER.debug('********** Recording a New Result **********')
         LOGGER.debug('Result:')
         LOGGER.debug(result)
@@ -273,42 +320,45 @@ class CQASearcher(Searcher):
             self._data[cat_key].append((trial_id, budget, loss))
             self._num_vals[cat_key][trial_id] = num_val
 
-            # Handle any back-log of fitted models so that we know if there
-            # are any free processes available.
-            self._check_for_models()
-            if self._processes_running < self._max_processes:
-                LOGGER.debug(f'The number of processes running {self._processes_running} is less than '
-                             f'the maximum allowed {self._max_processes}, so we are going to initiate '
-                             f'a new model-fitting process.')
-                # Gets the data with the best fidelity available for training,
-                # provied that we have collected enough new data since the last
-                # model fit. 
-                X_train, y_train, budgets, current_fidelity = self._get_data_for_training(
-                    self._data[cat_key], self._num_vals[cat_key], len(num_val), self._last_model_fidelity[cat_key])
-                min_n_samples_separable = SCQA.min_samples(len(num_val))
-                if X_train is not None:
-                    X_train = self._transformers[cat_key].transform(X_train)
-                    LOGGER.debug('Transformed X_train:')
-                    LOGGER.debug(X_train)
-                    # Scale the losses so that the constraints on the parameters
-                    # in the model don't make the optimal solution infeasable
-                    y_transformer = RobustScaler()
-                    y_train_untransformed = y_train
-                    y_train = y_transformer.fit_transform(y_train.reshape(-1, 1)).squeeze()
-                    LOGGER.debug('Transformed y_train:')
-                    LOGGER.debug(y_train)
-                    LOGGER.debug('Sample_weights (fidelity budgets):')
-                    LOGGER.debug(budgets)
-                    p = Process(target=fit_model,
-                                args=(X_train, y_train, budgets, self._model_queue, 
-                                      cat_key, y_transformer, current_fidelity))
-                    p.start()
-                    self._processes_running += 1
-                    LOGGER.debug(f'We now have {self._processes_running} model processes running.')
+            if update_model:
+                # Handle any back-log of fitted models so that we know if there
+                # are any free processes available.
+                self._check_for_models()
+                if self._processes_running < self._max_processes:
+                    LOGGER.debug(f'The number of processes running {self._processes_running} is less than '
+                                 f'the maximum allowed {self._max_processes}, so we are going to initiate '
+                                 f'a new model-fitting process.')
+                    # Gets the data with the best fidelity available for training,
+                    # provied that we have collected enough new data since the last
+                    # model fit. 
+                    X_train, y_train, budgets, current_fidelity = self._get_data_for_training(
+                        self._data[cat_key], self._num_vals[cat_key], len(num_val), self._last_model_fidelity[cat_key])
+                    min_n_samples_separable = SCQA.min_samples(len(num_val))
+                    if X_train is not None:
+                        X_train = self._transformers[cat_key].transform(X_train)
+                        LOGGER.debug('Transformed X_train:')
+                        LOGGER.debug(X_train)
+                        # Scale the losses so that the constraints on the parameters
+                        # in the model don't make the optimal solution infeasable
+                        y_transformer = RobustScaler()
+                        y_train_untransformed = y_train
+                        y_train = y_transformer.fit_transform(y_train.reshape(-1, 1)).squeeze()
+                        LOGGER.debug('Transformed y_train:')
+                        LOGGER.debug(y_train)
+                        LOGGER.debug('Sample_weights (fidelity budgets):')
+                        LOGGER.debug(budgets)
+                        p = Process(target=fit_model,
+                                    args=(X_train, y_train, budgets, self._model_queue, 
+                                          cat_key, y_transformer, current_fidelity))
+                        p.start()
+                        self._processes_running += 1
+                        LOGGER.debug(f'We now have {self._processes_running} model processes running.')
+                else:
+                    LOGGER.debug(f'There were too many processes running {self._processes_running} to '
+                                 f'start another one because the maximum allowed processes is '
+                                 f'{self._max_processes}')
             else:
-                LOGGER.debug(f'There were too many processes running {self._processes_running} to '
-                             f'start another one because the maximum allowed processes is '
-                             f'{self._max_processes}')
+                LOGGER.debug('Skipping model-fitting because update_model=False')
     
     def _check_for_models(self):
         while self._model_queue.qsize() > 0:
@@ -343,9 +393,15 @@ class CQASearcher(Searcher):
             else:
                 LOGGER.debug(f'It was an unsuccessful model fit for {cat_key}')
 
-    def _get_data_in_window(self, df, fidelity, window_size):
-        window = np.logical_and(fidelity <= df['Fidelity'], 
-                                df['Fidelity'] <= fidelity*self._reduction_factor**window_size)
+    def _get_data_in_window(self, df, fidelity, window_size, rtol=1e-2, atol=1e-2):
+        # Different backends calculate budget fidelities in slightly different ways
+        # causing floating point errors. Put in a generous amount of tolerance
+        # into the fidelity window bounds.
+        fidelity_lower = fidelity - (atol + rtol*np.abs(fidelity))
+        fidelity_upper = fidelity*self._reduction_factor**window_size
+        fidelity_upper = fidelity_upper + (atol + rtol*np.abs(fidelity))
+        window = np.logical_and(fidelity_lower <= df['Fidelity'], 
+                                df['Fidelity'] <= fidelity_upper)
         # Grab only the result with the largest fidelity for each configuration.
         data_in_window = df[window].groupby('ID').tail(1)
         return data_in_window
@@ -355,10 +411,13 @@ class CQASearcher(Searcher):
         min_n_samples_separable = SCQA.min_samples(n_dim)
         last_data = None
         df = _data_to_df(data)
+        if fidelity is None and len(df) > 0:
+            fidelity = df['Fidelity'].min()
         data_in_window = self._get_data_in_window(df, fidelity, self._window_size)
         LOGGER.debug(f'Checking to find the largest fidelity budget window with sufficient data '
                      f'to fit a model. '
                      f'Minimum number of training examples to fit model: {min_n_samples_separable}')
+        LOGGER.debug(f'Data that is avialable:\n{df}')
         LOGGER.debug(f'Budget fidelity window {fidelity} to '
                      f'{fidelity*self._reduction_factor**self._window_size} has '
                      f'{len(data_in_window)} data samples available.')
@@ -518,14 +577,16 @@ def fit_model(X_train, y_train, budgets, queue, *extra_args):
     success_ = False
     try:
         model.fit(X_train, y_train, sample_weight=budgets)
+        model_dict = model.to_dict()
         success_ = True
         LOGGER.debug('Successfully fit the model.')
     except Exception as e:
         # Something went wrong. Don't update the model.
         LOGGER.debug('Something went wrong with the model fitting and scoring process, '
                      'falling back on the previous model, if available.', exc_info=e)
-    model_dict = model.to_dict()
+        model_dict = None
     queue.put((success_, model_type, model_dict, X_train, y_train, budgets, extra_args))
+    LOGGER.debug('A model fitting process is ending')
 
 
 class Transformer():

@@ -5,8 +5,12 @@ import pandas as pd
 import numpy as np
 from scipy import stats
 
-from ray.tune import Analysis
-from ray.tune.error import TuneError
+try:
+    from ray.tune import Analysis
+    from ray.tune.error import TuneError
+    ray_available = True
+except:
+    ray_available = False
 
 def _get_trial_results(analysis, iter_fidelity, gpsls):
     results = []
@@ -266,6 +270,8 @@ def analyze_results(trial_analysis, objective='mean', mode='min',
       Contains the final incumbent configuration and the details of the total
       budget spent.
     """
+    if not ray_available:
+        raise ImportError('Requires ray.tune. Please install it first.')
     if mode != 'min':
         raise NotImplementedError('Currently only mode="min" is supported. Provided {}'.format(mode))
     df = _get_trial_results(trial_analysis, objective=='final', gpsls)

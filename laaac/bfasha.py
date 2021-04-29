@@ -14,8 +14,8 @@ class BFASHA:
                             (grace_period, {}),
                             (0, {})]  # Dumby milestone
         self._released = defaultdict(list)
-        self._times_suggested = defaultdict(set)
-        self._times_reported = defaultdict(int)
+        self._times_suggested = defaultdict(int)
+        self._times_reported = defaultdict(set)
         self._next_id = 0
 
     def suggest(self):

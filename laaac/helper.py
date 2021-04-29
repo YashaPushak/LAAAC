@@ -7,7 +7,11 @@ from contextlib import contextmanager
 
 import numpy as np
 
-from ray.tune.sample import uniform, loguniform, randint, choice, sample_from
+try:
+    from ray.tune.sample import uniform, loguniform, randint, choice, sample_from
+    ray_available = True
+except:
+    ray_available = False
 
 import ConfigSpace
 from ConfigSpace.hyperparameters import UniformFloatHyperparameter as Float
@@ -105,31 +109,32 @@ def load_obj(*args, **kwargs):
     loadObj(*args, **kwargs)
 
 
-def loguniform_int(a, b):
-    a = copy.deepcopy(a)
-    b = copy.deepcopy(b)
-    def _sample():
-        return int(loguniform(a, b).sample())
-    return _sample
-        
-
-def get_configuration_space(config_space):
-    configuration = {}
-    for hp in config_space.get_hyperparameters():
-        name = hp.name
-        if isinstance(hp, Integer):
-            if hp.log:
-                configuration[name] = sample_from(loguniform_int(hp.lower, hp.upper+1))
+if ray_available:
+    def loguniform_int(a, b):
+        a = copy.deepcopy(a)
+        b = copy.deepcopy(b)
+        def _sample():
+            return int(loguniform(a, b).sample())
+        return _sample
+            
+    
+    def get_configuration_space(config_space):
+        configuration = {}
+        for hp in config_space.get_hyperparameters():
+            name = hp.name
+            if isinstance(hp, Integer):
+                if hp.log:
+                    configuration[name] = sample_from(loguniform_int(hp.lower, hp.upper+1))
+                else:
+                    configuration[name] = randint(hp.lower, hp.upper+1)
+            elif isinstance(hp, Float):
+                if hp.log:
+                    configuration[name] = loguniform(hp.lower, hp.upper)
+                else:
+                    configuration[name] = uniform(hp.lower, hp.upper)
             else:
-                configuration[name] = randint(hp.lower, hp.upper+1)
-        elif isinstance(hp, Float):
-            if hp.log:
-                configuration[name] = loguniform(hp.lower, hp.upper)
-            else:
-                configuration[name] = uniform(hp.lower, hp.upper)
-        else:
-            configuration[name] = choice(hp.choices)
-    return configuration
+                configuration[name] = choice(hp.choices)
+        return configuration
 
 
 def read_instances(filename):

@@ -6,7 +6,11 @@ import json
 
 import numpy as np
 
-from ray.tune import Trainable
+try:
+    from ray.tune import Trainable
+    ray_available = True
+except:
+    ray_available = False
 
 from ConfigSpace.util import deactivate_inactive_hyperparameters
 
@@ -59,6 +63,9 @@ def gps_trainable_factory(TargetAlgorithmRunner, config_space, cutoff_time=None,
     <class 'GPSTrainable'>
       A class which can be instantiated to create a GPSTrainable object.
     """
+    if not ray_available:
+        raise ImportError('GPS Trainables require ray.tune. Please install it first. ')
+
     if catch_exceptions:
         ExceptionsToCatch = Exception
     else:
