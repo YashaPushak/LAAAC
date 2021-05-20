@@ -125,15 +125,15 @@ class CoreCQASearcher:
                  wall_time=None, wall_time_budget=None, model_fit_factor=1.5, 
                  max_concurrent_model_fits=1, window_size=0, log_location='CQA.log', log_level=logging.DEBUG,
                  log_formatter='%(asctime)s:%(name)s:%(levelname)s: %(message)s', **kwargs):
-        #if log_location is not None:
-        #    fh = logging.FileHandler(log_location)
-        #    fh.setLevel(log_level)
-        #    if log_formatter is not None:
-        #        if isinstance(log_formatter, str):
-        #            log_formatter = logging.Formatter(log_formatter)
-        #        fh.setFormatter(log_formatter)
-        #    LOGGER.addHandler(fh)
-        #LOGGER.setLevel(log_level)
+        if log_location is not None:
+            fh = logging.FileHandler(log_location)
+            fh.setLevel(log_level)
+            if log_formatter is not None:
+                if isinstance(log_formatter, str):
+                    log_formatter = logging.Formatter(log_formatter)
+                fh.setFormatter(log_formatter)
+            LOGGER.addHandler(fh)
+        LOGGER.setLevel(log_level)
         LOGGER.debug('**************************************************')
         LOGGER.debug('********** Initializing the CQA Searcher **********')
         LOGGER.debug('**************************************************')
@@ -164,6 +164,7 @@ class CoreCQASearcher:
         self._max_processes = max_concurrent_model_fits
         self._processes_running = 0
         self._window_size = window_size
+        self._model_fit_status = []
         self._model_fit_factor = model_fit_factor
         self._try_moonshots = False
         self._data = {}
@@ -183,13 +184,14 @@ class CoreCQASearcher:
                 break
         self._transformers = {}
         self._y_transformers = defaultdict(RobustScaler)
+        self._suggested_default = defaultdict(bool)  # initializes to False
+        self._suggested_default_cat = False
         LOGGER.debug('**************************************************')
         LOGGER.debug('********** Initialized the CQA Searcher **********')
         LOGGER.debug('**************************************************')
 
     @exception_logging()
     def suggest(self, trial_id):
-        eliminated = True
         LOGGER.debug('********** Suggesting a Configuration **********')
         if self._cat:
             # Together, the cat and num IDs form a unique id from the
@@ -200,7 +202,13 @@ class CoreCQASearcher:
                              'categorical values. Attempting to find one with '
                              'random sampling')
                 for _ in range(50):
-                    config_obj = self._config_space.sample_configuration()
+                    if False and not self._suggested_default_cat:
+                        LOGGER.debug('We are starting by suggesting the default configuration '
+                                     'for the categorical hyper-parameters')
+                        config_obj = self._config_space.get_default_configuration()
+                        self._suggested_default_cat = True
+                    else:
+                        config_obj = self._config_space.sample_configuration()
                     # Convert to a dict to work with internally
                     config = dict(config_obj)
                     # Check to see if this combination of categorical values has been seen before
@@ -256,14 +264,20 @@ class CoreCQASearcher:
                 # If it wasn't already suggested, then we're about to.
                 self._suggested_optimizer[cat_key] = True
             else:
-                # Transform the numeric hyper-parameters to a unit cube
-                if cat_key not in self._transformers:
-                    transformer = Transformer()
-                    transformer.fit(num_hp, self._config_space)
-                    self._transformers[cat_key] = transformer
-                num_val = np.random.random(len(num_val))
-                LOGGER.debug('Sampling a new set of numeric values at random.')
-                num_val = self._transformers[cat_key].inverse_transform(num_val)
+                if False and not self._suggested_default[cat_key]:
+                    LOGGER.debug('We are starting the search amongst this set of numeric-valued '
+                                 'hyper-parameters by recommending the defaults.')
+                    num_val = [self._config_space.get_hyperparameter(str(hp)).default_value for hp in num_hp]
+                    self._suggested_default[cat_key] = True
+                else:
+                    # Transform the numeric hyper-parameters to a unit cube
+                    if cat_key not in self._transformers:
+                        transformer = Transformer()
+                        transformer.fit(num_hp, self._config_space)
+                        self._transformers[cat_key] = transformer
+                    num_val = np.random.random(len(num_val))
+                    LOGGER.debug('Sampling a new set of numeric values at random.')
+                    num_val = self._transformers[cat_key].inverse_transform(num_val)
             config = self._to_configuration(num_hp, num_val, cat_hp, cat_val)
         # Convert to a Configuration for pretty printing
         configuration = Configuration(self._config_space, config)
@@ -362,11 +376,16 @@ class CoreCQASearcher:
     
     def _check_for_models(self):
         while self._model_queue.qsize() > 0:
-            success_, model_type, model_dict, X_train, y_train, budgets, args = self._model_queue.get()
-            cat_key, y_transformer, current_fidelity = args
+            success_, model_type, model_dict, X_train, y_train, budgets, args, logs, exception = self._model_queue.get()
             self._processes_running -= 1
+            cat_key, y_transformer, current_fidelity = args
             LOGGER.debug('Found a new result in the model queue.')
             LOGGER.debug(f'We now have {self._processes_running} model processes running.')
+            LOGGER.debug('The following log messages came from the model-fitting process:')
+            for log in logs:
+                LOGGER.debug(log)
+            if exception is not None:
+                LOGGER.debug('The worker process encountered the following exception.', exc_info=exception)
             if success_:
                 LOGGER.debug(f'It was a successful model fit for {cat_key}')
                 model = GCQA() if model_type == 'GCQA' else SCQA()
@@ -388,10 +407,15 @@ class CoreCQASearcher:
                     self._suggested_optimizer[cat_key] = False
                     self._last_model_fidelity[cat_key] = current_fidelity
                     LOGGER.debug('Accepted the new model.')
+                    self._model_fit_status.append('Success')
                 else:
                     LOGGER.debug('Rejected the new model; keeping the old one for now.')
+                    self._model_fit_status.append('Regression')
             else:
                 LOGGER.debug(f'It was an unsuccessful model fit for {cat_key}')
+                self._model_fit_status.append('Unsuccessful')
+            LOGGER.debug(f'History of model-fitting process result statuses:\n'
+                         f'{pd.Series(self._model_fit_status).value_counts()}')
 
     def _get_data_in_window(self, df, fidelity, window_size, rtol=1e-2, atol=1e-2):
         # Different backends calculate budget fidelities in slightly different ways
@@ -561,17 +585,23 @@ def _data_to_df(data):
 
 
 def fit_model(X_train, y_train, budgets, queue, *extra_args):
-    LOGGER.debug('A model fitting process is starting')
+    # multi-processing and logging in python can cause deadlocks. There are
+    # workarounds, but rather than spending effort figuring out those, we're
+    # just going to make a list of logging statements, send them back with
+    # the result and log them when we collect the result.
+    logs = []
+    exception = None
+    logs.append('A model fitting process is starting')
     n_samples = len(X_train)
     min_n_samples_general = GCQA.min_samples(X_train.shape[1])
     if n_samples >= min_n_samples_general:
-        LOGGER.debug('Fitting a general convex quadratic under-estimator model.')
+        logs.append('Fitting a general convex quadratic under-estimator model.')
         model = GCQA()
         model_type = 'GCQA'
     else:
-        LOGGER.debug(f'Number of training examples is less than the minimum number '
-                     f'({min_n_samples_general}) required to fit a general convex '
-                     f'quadratic model, so we are fitting a separable one instead.')
+        logs.append(f'Number of training examples is less than the minimum number '
+                    f'({min_n_samples_general}) required to fit a general convex '
+                    f'quadratic model, so we are fitting a separable one instead.')
         model = SCQA()
         model_type = 'SCQA'
     success_ = False
@@ -579,14 +609,17 @@ def fit_model(X_train, y_train, budgets, queue, *extra_args):
         model.fit(X_train, y_train, sample_weight=budgets)
         model_dict = model.to_dict()
         success_ = True
-        LOGGER.debug('Successfully fit the model.')
+        logs.append('Successfully fit the model.')
     except Exception as e:
         # Something went wrong. Don't update the model.
-        LOGGER.debug('Something went wrong with the model fitting and scoring process, '
-                     'falling back on the previous model, if available.', exc_info=e)
+        logs.append('Something went wrong with the model fitting and scoring process, '
+                    'falling back on the previous model, if available.')
+        exception = e
         model_dict = None
-    queue.put((success_, model_type, model_dict, X_train, y_train, budgets, extra_args))
-    LOGGER.debug('A model fitting process is ending')
+    logs.append('A model fitting process is ending')
+    logs = []
+    exception = None
+    queue.put((success_, model_type, model_dict, X_train, y_train, budgets, extra_args, logs, exception))
 
 
 class Transformer():

@@ -1,4 +1,6 @@
+import logging
 import traceback
+from contextlib import contextmanager
 
 import numpy as np
 from scipy.optimize import dual_annealing
@@ -12,6 +14,22 @@ except:
     bohb_available = False    
 
 
+
+LOGGER = logging.getLogger('BOHB-Exact')
+
+
+@contextmanager
+def exception_logging():
+    try:
+        yield
+    except Exception as e:
+        LOGGER.error('An exception occured.', exc_info=e)
+        raise e
+    finally:
+        pass
+
+
+
 class BOHBExact:
     def __init__(self, *args, **kwargs):
         raise ImportError('the hpperbandster package must be available first. Please install it.')
@@ -20,6 +38,7 @@ class BOHBExact:
 if bohb_available:
     class BOHBExact(BOHB):
     
+        @exception_logging()
         def get_config(self, budget):
             """
             Function to sample a new configuration
@@ -75,11 +94,20 @@ if bohb_available:
     
                     lower_bounds = np.zeros((len(self.vartypes), 1))
                     upper_bounds = np.ones((len(self.vartypes), 1))
-                    upper_bounds[cats,:] = self.vartypes[cats]
-                    bounds = np.append([lower_bounds, upper_bounds], axis=1)
+                    upper_bounds[cats, 0] = self.vartypes[cats]
+                    bounds = np.append(lower_bounds, upper_bounds, axis=1)
     
                     res = dual_annealing(aquisition_function, bounds)
                     best_vector = res.x if res.success else None
+                    best = aquisition_function(best_vector)
+                    self.logger.debug(f'Dual annealing optimization Result: {res}')
+                    random_scores = []
+                    for _ in range(50):
+                       x = np.random.random(len(best_vector))
+                       for cat in np.where(cats)[0]:
+                           x[cat] = np.random.randint(*bounds[cat])
+                       random_scores.append(aquisition_function(x))
+                    self.logger.debug(f'Random aquisition scores: {np.quantile(random_scores, [0, 0.25, 0.5, 0.75, 1])}')
                     
                     if best_vector is None:
                         self.logger.debug("Sampling based optimization with %i samples failed -> using random configuration"%self.num_samples)
@@ -127,4 +155,5 @@ if bohb_available:
                                     sample)
                 sample = self.configspace.sample_configuration().get_dictionary()
             self.logger.debug('done sampling a new configuration.')
+            self.logger.debug(f'Configuration being suggested:\n{sample}')
             return sample, info_dict
