@@ -566,7 +566,7 @@ class CoreCQASearcher:
                 x_next = x_next[feasable]
                 LOGGER.debug(f'Found {len(x_next)} feasable configurations for the numeric hyperparameters.')
                 x_next = x_next[np.argmin(model.predict(x_next))]
-                LOGGER.debug('Picked the one with the best score predicted by the mdoel.')
+                LOGGER.debug('Picked the one with the best score predicted by the model.')
             else:
                 # Sample a random configuration from the unit cube to
                 # help improve the model.

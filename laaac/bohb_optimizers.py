@@ -12,9 +12,10 @@ except:
     bohb_available = False
 
 from laaac.bohb_cqa_searcher import CQAHB as CG_CQAHB
+from laaac.bohb_gpsls_searcher import GPSLSHB as CG_GPSLSHB
 from laaac.bohb_exact import BOHBExact as CG_BOHBExact
 
-LOGGER = logging.getLogger('CQAHB')
+LOGGER = logging.getLogger('laaac')
 
 
 class CQAHB:
@@ -111,6 +112,97 @@ if bohb_available:
             
             return(SuccessiveHalving(HPB_iter=iteration, num_configs=ns, budgets=self.budgets[(-s-1):],
                                      config_sampler=self.config_generator.get_config, **iteration_kwargs))
+
+
+    class GPSLSHB(Master):
+        def __init__(self, configspace=None,
+                     eta=3, min_budget=0.01, max_budget=1,
+                     gps_kwargs=None,
+                     **kwargs ):
+            """
+            BOHB performs robust and efficient hyperparameter optimization
+            at scale by combining the speed of Hyperband searches with the
+            guidance and guarantees of convergence of Bayesian
+            Optimization. Instead of sampling new configurations at random,
+            BOHB uses kernel density estimators to select promising candidates.
+    
+            Parameters
+            ----------
+            configspace: ConfigSpace object
+              valid representation of the search space
+            eta : float
+              In each iteration, a complete run of sequential halving is executed. In it,
+              after evaluating each configuration on the same subset size, only a fraction of
+              1/eta of them 'advances' to the next round.
+              Must be greater or equal to 2.
+            min_budget : float
+              The smallest budget to consider. Needs to be positive!
+            max_budget : float
+              The largest budget to consider. Needs to be larger than min_budget!
+              The budgets will be geometrically distributed
+              :math:`a^2 + b^2 = c^2 \sim \eta^k` for :math:`k\in [0, 1, ... , num\_subsets - 1]`.
+            gps_kwargs : dict | None
+              Other key-work arguements used by the GPSLS searcher algorithm.
+            """
+            LOGGER.debug('Initializing GPSLSHB')
+            if not isinstance(configspace, CS.ConfigurationSpace):
+                raise ValueError(f'You have to provide a valid ConfigSpace object. ' 
+                                 f'Proivded {configspace} ({type(configspace)}).')
+    
+            if gps_kwargs is None:
+                gps_kwargs = {}        
+            gps_kwargs.update(dict(config_space=configspace)) 
+            LOGGER.debug(f'Prepared key-word arguments for BOHB-style wrapper for GPS: \n'
+                         f'{gps_kwargs}')
+            cg = CG_GPSLSHB(**gps_kwargs)
+            LOGGER.debug(f'Initialized BOHB-style wrapper for GPSLS.')
+           
+            super().__init__(config_generator=cg, **kwargs)
+            LOGGER.debug(f'Called super().__init__')
+           
+            # Hyperband related stuff
+            self.eta = eta
+            self.min_budget = min_budget
+            self.max_budget = max_budget
+            
+            # precompute some HB stuff
+            self.max_SH_iter = -int(np.log(min_budget/max_budget)/np.log(eta)) + 1
+            self.budgets = max_budget * np.power(eta, -np.linspace(self.max_SH_iter-1, 0, self.max_SH_iter))
+            
+            self.config.update({
+                'eta'        : eta,
+                'min_budget' : min_budget,
+                'max_budget' : max_budget,
+                'budgets'    : self.budgets,
+                'max_SH_iter': self.max_SH_iter,
+                'gps_kwargs' : gps_kwargs})
+            LOGGER.debug('Finished doing the "Hyperband related stuff".')
+            LOGGER.debug('Done initializing GPSLSHB.')
+    
+        def get_next_iteration(self, iteration, iteration_kwargs={}):
+            """
+            GPSLS-HB uses (just like Hyperband) SuccessiveHalving for each iteration.
+            See Li et al. (2016) for reference.
+            
+            Parameters
+            ----------
+            iteration: int
+              the index of the iteration to be instantiated
+            Returns
+            -------
+            SuccessiveHalving: the SuccessiveHalving iteration with the
+              corresponding number of configurations
+            """
+            # number of 'SH rungs'
+            s = self.max_SH_iter - 1 - (iteration%self.max_SH_iter)
+            # number of configurations in that bracket
+            n0 = int(np.floor((self.max_SH_iter)/(s+1)) * self.eta**s)
+            ns = [max(int(n0*(self.eta**(-i))), 1) for i in range(s+1)]
+            
+            return(SuccessiveHalving(HPB_iter=iteration, num_configs=ns, budgets=self.budgets[(-s-1):],
+                                     config_sampler=self.config_generator.get_config, **iteration_kwargs))
+
+
 
 class BOHBExact(Master):
     def __init__(self, configspace = None,
