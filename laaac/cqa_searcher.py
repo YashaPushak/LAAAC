@@ -9,6 +9,15 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import minimize_scalar
 from sklearn.preprocessing import RobustScaler
+try:
+    from sklearn.preprocessing import SplineTransformer
+    spline_available = True
+except:
+    spline_available = False
+from sklearn.linear_model import LassoCV
+from sklearn.pipeline import make_pipeline
+from sklearn.svm import SVR
+from sklearn.model_selection import RandomizedSearchCV
 
 try:
     from ray.tune.suggest import Searcher
@@ -112,6 +121,10 @@ class CoreCQASearcher:
     max_concurrent_model_fits : int
       The models are fit in separate python processes. This limits the maximum
       number of models that can be fit at any one time. Must be at least 1.
+    surrogate : 'CQA' | 'spline' | 'SVM'
+      Determines wether or not convex quadratic approximation is used as the
+      surrogate model or if a multi-layer perceptron is used as the surrogate
+      model.
     log_location : str | None
       Optionally enables logging to a file.
     log_level : int
@@ -123,7 +136,8 @@ class CoreCQASearcher:
     def __init__(self, config_space, metric, max_t, grace_period=1, reduction_factor=4, mode='min',
                  budget='budget', failed_result=1, random_fraction=0.5,
                  wall_time=None, wall_time_budget=None, model_fit_factor=1.5, 
-                 max_concurrent_model_fits=1, window_size=0, log_location='CQA.log', log_level=logging.DEBUG,
+                 max_concurrent_model_fits=1, window_size=0, surrogate='CQA',
+                 log_location='CQA.log', log_level=logging.DEBUG,
                  log_formatter='%(asctime)s:%(name)s:%(levelname)s: %(message)s', **kwargs):
         if log_location is not None:
             fh = logging.FileHandler(log_location)
@@ -154,6 +168,7 @@ class CoreCQASearcher:
         self._random_fraction = random_fraction
         self._configurations = {}
         self._models = {}
+        self._surrogate = surrogate
         self._suggested_optimizer = defaultdict(bool)  # Initializes to False
         self._last_model_fidelity = defaultdict(lambda: None)
         process_manager = Manager()
@@ -362,7 +377,7 @@ class CoreCQASearcher:
                         LOGGER.debug('Sample_weights (fidelity budgets):')
                         LOGGER.debug(budgets)
                         p = Process(target=fit_model,
-                                    args=(X_train, y_train, budgets, self._model_queue, 
+                                    args=(X_train, y_train, budgets, self._model_queue, self._surrogate,
                                           cat_key, y_transformer, current_fidelity))
                         p.start()
                         self._processes_running += 1
@@ -387,9 +402,12 @@ class CoreCQASearcher:
             if exception is not None:
                 LOGGER.debug('The worker process encountered the following exception.', exc_info=exception)
             if success_:
-                LOGGER.debug(f'It was a successful model fit for {cat_key}')
-                model = GCQA() if model_type == 'GCQA' else SCQA()
-                model.from_dict(model_dict)
+                LOGGER.debug(f'It was a successful {model_type} model fit for {cat_key}')
+                if model_type in ['GCQA', 'SCQA']:
+                    model = GCQA() if model_type == 'GCQA' else SCQA()
+                    model.from_dict(model_dict)
+                else:
+                    model = model_dict
                 y_train = y_transformer.inverse_transform(y_train.reshape((-1, 1))).squeeze()
                 if cat_key in self._models:
                     old_pred = self._y_transformers[cat_key].inverse_transform(
@@ -432,7 +450,7 @@ class CoreCQASearcher:
 
     def _get_data_for_training(self, data, num_vals, n_dim, fidelity):
         # Setup
-        min_n_samples_separable = SCQA.min_samples(n_dim)
+        min_n_samples_separable = SCQA.min_samples(n_dim) if self._surrogate == 'CQA' else n_dim*2 + 8
         last_data = None
         df = _data_to_df(data)
         if fidelity is None and len(df) > 0:
@@ -584,7 +602,7 @@ def _data_to_df(data):
     return df
 
 
-def fit_model(X_train, y_train, budgets, queue, *extra_args):
+def fit_model(X_train, y_train, budgets, queue, surrogate, *extra_args):
     # multi-processing and logging in python can cause deadlocks. There are
     # workarounds, but rather than spending effort figuring out those, we're
     # just going to make a list of logging statements, send them back with
@@ -592,22 +610,45 @@ def fit_model(X_train, y_train, budgets, queue, *extra_args):
     logs = []
     exception = None
     logs.append('A model fitting process is starting')
-    n_samples = len(X_train)
-    min_n_samples_general = GCQA.min_samples(X_train.shape[1])
-    if n_samples >= min_n_samples_general:
-        logs.append('Fitting a general convex quadratic under-estimator model.')
-        model = GCQA()
-        model_type = 'GCQA'
+    if surrogate == 'CQA':
+        n_samples = len(X_train)
+        min_n_samples_general = GCQA.min_samples(X_train.shape[1])
+        if n_samples >= min_n_samples_general:
+            logs.append('Fitting a general convex quadratic under-estimator model.')
+            model = GCQA()
+            model_type = 'GCQA'
+        else:
+            logs.append(f'Number of training examples is less than the minimum number '
+                        f'({min_n_samples_general}) required to fit a general convex '
+                        f'quadratic model, so we are fitting a separable one instead.')
+            model = SCQA()
+            model_type = 'SCQA'
+        sample_weight = {'sample_weight': budgets}
+    elif surrogate == 'spline':
+        model_type = 'spline'
+        model = make_pipeline(SplineTransformer(),
+                              LassoCV())
+        sample_weight = {}  # Not supported with Spline Regression
     else:
-        logs.append(f'Number of training examples is less than the minimum number '
-                    f'({min_n_samples_general}) required to fit a general convex '
-                    f'quadratic model, so we are fitting a separable one instead.')
-        model = SCQA()
-        model_type = 'SCQA'
+        model_type = 'SVM'
+        model = SVR()
+        # generate a bunch of random hyper-parameters from which values will be sampled
+        # Ranges come from the "optimal" hyper-parameter tuning ranges" as identified in
+        # "Tunability: Importance of Hyperparameters of Machine Learning Algorithms",
+        # Probst et al., JMLR, 2019.
+        configuration_space = {
+           'C': np.random.uniform(0.002, 920.582, 100),
+           'gamma': np.random.uniform(0.003, 18.195, 100)}
+        model = RandomizedSearchCV(model, configuration_space)
+        sample_weight = {}  # Not supported with SVR
+  
     success_ = False
     try:
-        model.fit(X_train, y_train, sample_weight=budgets)
-        model_dict = model.to_dict()
+        model.fit(X_train, y_train, **sample_weight)
+        if model_type in ['SCQA', 'GCQA']:
+            model_dict = model.to_dict()
+        else:
+            model_dict = model
         success_ = True
         logs.append('Successfully fit the model.')
     except Exception as e:
