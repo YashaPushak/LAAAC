@@ -1,7 +1,0 @@
-pcs-file = params.pcs
-instances = instances.txt
-algo = algorithm_runner.py
-runcount_limit = 200
-wallclock_limit = 60
-crashed_loss = 1
-verbose = 2

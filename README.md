@@ -23,6 +23,9 @@ to a spline approximation by passing the argument
 `cqa_kwargs={'surrogate': 'spline'}`. Documentation for the additional 
 CQA-supported key-word arguments can be found in `laaac/cqa_searcher.py`.
 
+More information about how to use the ray-based version of the code can
+be found in the `ray` branch.
+
 This repository is a work in progress and it builds on a line of research 
 (see https://www.cs.ubc.ca/labs/algorithms/Projects/ACLandscapes/index.html) 
 that seeks to analyze and exploit algorithm configuration landscape structure.
