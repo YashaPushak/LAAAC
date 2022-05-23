@@ -1,7 +1,7 @@
 from setuptools import setup
 
 setup(name='laaac',
-      version='0.0.1',
+      version='0.0.2',
       description='Landscape-Aware Automated Algorithm Configuration',
       author='Yasha Pushak',
       author_email='ypushak@cs.ubc.ca',
@@ -12,9 +12,11 @@ setup(name='laaac',
           'pandas>=1.1.1',
           'scipy>=1.5.4',
           'scikit-learn>=0.23.2',
-          'ConfigSpace>=0.4.16'],
+          'ConfigSpace>=0.4.16',
+          'hpbandstre',
+      ],
       extras_require={
           'plot': ['streamlit>=0.79.0'],
           'ray': ['ray>1.1.0'],
-          'hpbandster': ['hpbandster']},
+      },
       zip_safe=False)
