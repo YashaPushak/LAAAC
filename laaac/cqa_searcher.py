@@ -517,7 +517,7 @@ class CoreCQASearcher:
         return config
 
     def _get_next_config(self, model, suggested_optimizer, data, num_vals, transformer, random_fraction,
-                         last_model_fidelity,  n_samples=3, top_k=3):
+                         last_model_fidelity,  n_samples=20, top_k=3):
         df = _data_to_df(data)
         n_configs_evaluated = len(df.groupby('ID').tail(1))
         df = self._get_data_in_window(df, last_model_fidelity, window_size=2)
