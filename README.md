@@ -23,30 +23,31 @@ to a spline approximation by passing the argument
 `cqa_kwargs={'surrogate': 'spline'}`. Documentation for the additional 
 CQA-supported key-word arguments can be found in `laaac/cqa_searcher.py`.
 
-This repository is a work in progress and it builds upon the line of research:
+This repository is a work in progress and it builds on a line of research 
+(see https://www.cs.ubc.ca/labs/algorithms/Projects/ACLandscapes/index.html) 
+that seeks to analyze and exploit algorithm configuration landscape structure.
 
- - Yasha Pushak and Holger H. Hoos.  
+- \[Pushak & Hoos, 2022a\] Yasha Pushak and Holger H. Hoos.  
+**AutoML Loss Landscapes.**  
+Under review at *Transactions on Evolutionary Optimization and Learning (TELO)*.
+- \[Pushak & Hoos, 2022b\] Yasha Pushak and Holger H. Hoos.  
+**Experimental Procedures for Exploiting AutoML Loss Landscape Structure.**  
+Preprint.  
+- \[Pushak, 2022\] Yasha Pushak.  
+**Algorithm Configuration Landscapes: Analysis & Exploitation.**  
+*PhD Thesis, The University of British Columbia.*  
+ - \[Pushak & Hoos, 2020\] Yasha Pushak and Holger H. Hoos.  
 **Golden Parameter Search: Exploiting Structure to Quickly Configure Parameters
 In Parallel.**  
 *In Proceedings of the Twenty-Second Interntional Genetic and Evolutionary 
 Computation Conference (GECCO 2020)*. pp 245-253 (2020).  
 **Won the 2020 GECCO ECOM Track best paper award.**
- - Yasha Pushak and Holger H. Hoos.  
+ - \[Pushak & Hoos, 2018\] Yasha Pushak and Holger H. Hoos.  
 **Algorithm Configuration Landscapes: More Benign than Expected?**  
 *In Proceedings of the Fifteenth Internationl Conference on Parallel Problem 
 Solving from Nature (PPSN 2018)*. pp 271-283 (2018).  
 **Won the 2018 PPSN best paper award.**
 
-# Table of Contents
-
-   * [Landscape-Aware Automated Algorithm Configuration](#landscape-aware-automated-algorithm-configuration)
-   * [Table of Contents](#table-of-contents)
-   * [Installing LAAAC](#installing-laaac)
-   * [Quick Start Guide](#quick-start-guide)
-   * [LAAAC Arguments](#laaac-arguments)
-      * [Setup Arguments](#setup-arguments)
-      * [Scenario Arguments](#scenario-arguments)
-   * [Contact](#contact)
 
 # Installing LAAAC
 
