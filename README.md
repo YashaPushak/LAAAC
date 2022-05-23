@@ -20,7 +20,8 @@ In particular:
 By default, this will use a convex quadratic approximation (CQA) model as the
 surrogate model that is fitted to the landscape. However, this can be changed
 to a spline approximation by passing the argument 
-`cqa_kwargs={'surrogate': 'spline'}`.
+`cqa_kwargs={'surrogate': 'spline'}`. Documentation for the additional 
+CQA-supported key-word arguments can be found in `laaac/cqa_searcher.py`.
 
 This repository is a work in progress and it builds upon the line of research:
 

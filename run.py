@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""
+This file was originally created for convenient use of the experimental
+procedures when using ray. However, it is now deprecated in favour of the
+more competitive implementation of the procedures that makes use of BOHB's
+code for parallelization.
+"""
 
 import copy
 import time
