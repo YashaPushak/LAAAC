@@ -11,7 +11,8 @@ For this reason, these search procedures have been re-purposed to be used
 as alternative search procedures to the Bayesian optimization used by
 BOHB (Bayesian optimization with Hyperband).
 
-This version of the code can be used in exactly the same way as BOHB, except
+This version of the code can be used in exactly the same way as BOHB, 
+(https://automl.github.io/HpBandSter/build/html/index.html) except
 instead of using their optimizer, import and use the one from this package.
 In particular:
 
